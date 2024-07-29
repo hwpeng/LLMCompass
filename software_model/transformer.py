@@ -3,6 +3,7 @@ from software_model.operators import (
     Reshape,
     Concat,
     Transpose,
+    Repeat,
 )
 from software_model.matmul import Matmul, BatchedMatmul
 from software_model.softmax import Softmax
@@ -36,15 +37,16 @@ class TransformerBlockInitComputationTP(Operator):
             self.d_ffn = d_ffn
         # parameters per device
         d = d_model
+        d_h = d // n_heads
         self.Wq = Tensor([d, d // device_count], data_type)
-        self.Wk = Tensor([d, d // device_count], data_type)
-        self.Wv = Tensor([d, d // device_count], data_type)
+        self.Wk = Tensor([d, d_h * self.n_kv_heads // device_count], data_type)
+        self.Wv = Tensor([d, d_h * self.n_kv_heads // device_count], data_type)
         self.W0 = Tensor([d // device_count, d], data_type)
-        self.W1 = Tensor([d, d_ffn // device_count], data_type)
-        self.W2 = Tensor([d_ffn // device_count, d], data_type)
+        self.W1 = Tensor([d, self.d_ffn // device_count], data_type)
+        self.W2 = Tensor([self.d_ffn // device_count, d], data_type)
         if self.activation == "silu":
             # (swish(xw1) * (xw3)) * w3
-            self.W3 = Tensor([d, d_ffn / device_count], data_type)
+            self.W3 = Tensor([d, self.d_ffn / device_count], data_type)
         # operators per device
         # # multi-head attention
         self.Q_proj = Matmul(data_type)
@@ -53,6 +55,8 @@ class TransformerBlockInitComputationTP(Operator):
         self.Q_reshape = Reshape(data_type)
         self.K_reshape = Reshape(data_type)
         self.V_reshape = Reshape(data_type)
+        self.K_repeat = Repeat(data_type)
+        self.V_repeat = Repeat(data_type)
         self.Q_transpose = Transpose(data_type)
         self.K_transpose = Transpose(data_type)
         self.V_transpose = Transpose(data_type)
@@ -85,25 +89,30 @@ class TransformerBlockInitComputationTP(Operator):
         h = self.n_heads
         dev_cnt = self.device_count
         d_h = d // h
+        kv_h = self.n_kv_heads
 
         # multi-head attention
         Q = self.Q_proj(X, self.Wq)  # [b, s, d / dev_cnt]
         assert Q.shape == [b, s, d // dev_cnt]
-        K = self.K_proj(X, self.Wk)  # [b, s, d / dev_cnt]
-        V = self.V_proj(X, self.Wv)  # [b, s, d / dev_cnt]
+        K = self.K_proj(X, self.Wk)  # [b, s, d_h * n_kv_heads / dev_cnt]
+        V = self.V_proj(X, self.Wv)  # [b, s, d_h * n_kv_heads / dev_cnt]
         Q = self.Q_reshape(Q, [b, s, h // dev_cnt, d_h])
-        K = self.K_reshape(K, [b, s, h // dev_cnt, d_h])
-        V = self.V_reshape(V, [b, s, h // dev_cnt, d_h])
+        K = self.K_reshape(K, [b, s, kv_h // dev_cnt, d_h])
+        V = self.V_reshape(V, [b, s, kv_h // dev_cnt, d_h])
         Q_T = self.Q_transpose(Q, [0, 2, 1, 3])  # [b, h / dev_cnt, s, d_h]
         assert Q_T.shape == [b, h // dev_cnt, s, d_h]
-        K_T = self.K_transpose(K, [0, 2, 3, 1])  # [b, h / dev_cnt, d_h, s]
-        assert K_T.shape == [b, h // dev_cnt, d_h, s]
-        V_T = self.V_transpose(V, [0, 2, 1, 3])  # [b, h / dev_cnt, s, d_h]
-        assert V_T.shape == [b, h // dev_cnt, s, d_h]
-        A = self.Q_mul_K(Q_T, K_T)  # [b, h / dev_cnt, s, s]
+        K_T = self.K_transpose(K, [0, 2, 3, 1])  # [b, kv_h / dev_cnt, d_h, s]
+        assert K_T.shape == [b, kv_h // dev_cnt, d_h, s]
+        K_R = self.K_repeat(K_T, 1, h // kv_h) # [b, h / dev_cnt, d_h, s]
+        assert K_R.shape == [b, h // dev_cnt, d_h, s]
+        V_T = self.V_transpose(V, [0, 2, 1, 3])  # [b, kv_h / dev_cnt, s, d_h]
+        assert V_T.shape == [b, kv_h // dev_cnt, s, d_h]
+        V_R = self.V_repeat(V_T, 1, h // kv_h) # [b, h / dev_cnt, s, d_h]
+        assert V_R.shape == [b, h // dev_cnt, s, d_h]
+        A = self.Q_mul_K(Q_T, K_R)  # [b, h / dev_cnt, s, s]
         assert A.shape == [b, h // dev_cnt, s, s]
         A_prob = self.A_softmax(A)
-        H = self.A_mul_V(A_prob, V_T)  #  [b, h / dev_cnt, s, d_h]
+        H = self.A_mul_V(A_prob, V_R)  #  [b, h / dev_cnt, s, d_h]
         assert H.shape == [b, h // dev_cnt, s, d_h]
         H = self.H_transpose(H, [0, 2, 1, 3])  #  [b, s, h / dev_cnt, d_h]
         assert H.shape == [b, s, h // dev_cnt, d_h]
@@ -140,8 +149,9 @@ class TransformerBlockInitComputationTP(Operator):
         device = system.device
         interconnect = system.interconnect
 
-        qkv_latency = 3 * (
-            self.Q_proj.roofline_model(device) + device.compute_module.overhead.matmul
+        qkv_latency = (
+            self.Q_proj.roofline_model(device) + device.compute_module.overhead.matmul +
+            2 * (self.K_proj.roofline_model(device) + device.compute_module.overhead.matmul)
         )
         q_mul_k_latency = (
             self.Q_mul_K.roofline_model(device) + device.compute_module.overhead.matmul
@@ -235,9 +245,9 @@ class TransformerBlockInitComputationTP(Operator):
 
         # matmul
         print("simulating qkv")
-        qkv_latency = 3 * (
-            self.Q_proj.compile_and_simulate(device, compile_mode)
-            + device.compute_module.overhead.matmul
+        qkv_latency = (
+            self.Q_proj.compile_and_simulate(device, compile_mode) + device.compute_module.overhead.matmul +
+            2 * (self.K_proj.compile_and_simulate(device, compile_mode) + device.compute_module.overhead.matmul)
         )
         print("simulating q_mul_k")
         q_mul_k_latency = (
@@ -339,8 +349,8 @@ class TransformerBlockInitComputationTP(Operator):
     def run_on_gpu(self):
         # matmul
         qkv_latency = (
-            self.Q_proj.run_on_gpu()  # - self.Q_proj.gpu_kernel_launch_overhead()
-        ) * 3
+            self.Q_proj.run_on_gpu() + 2 * self.K_proj.run_on_gpu()
+        )
         q_mul_k_latency = (
             self.Q_mul_K.run_on_gpu()  # - self.Q_mul_K.gpu_kernel_launch_overhead()
         )
@@ -437,15 +447,16 @@ class TransformerBlockAutoRegressionTP(Operator):
             self.d_ffn = d_ffn
         # parameters per device
         d = d_model
+        d_h = d // n_heads
         self.Wq = Tensor([d, d // device_count], data_type)
-        self.Wk = Tensor([d, d // device_count], data_type)
-        self.Wv = Tensor([d, d // device_count], data_type)
+        self.Wk = Tensor([d, d_h * self.n_kv_heads // device_count], data_type)
+        self.Wv = Tensor([d, d_h * self.n_kv_heads // device_count], data_type)
         self.W0 = Tensor([d // device_count, d], data_type)
         self.W1 = Tensor([d, self.d_ffn // device_count], data_type)
         self.W2 = Tensor([self.d_ffn // device_count, d], data_type)
         if self.activation == "silu":
             # (swish(xw1) * (xw3)) * w3
-            self.W3 = Tensor([d, d_ffn / device_count], data_type)
+            self.W3 = Tensor([d, self.d_ffn / device_count], data_type)
         # operators per device
         # # multi-head attention
         self.Q_proj = Matmul(data_type)
@@ -457,6 +468,8 @@ class TransformerBlockAutoRegressionTP(Operator):
         self.Q_transpose = Transpose(data_type)
         self.K_transpose = Transpose(data_type)
         self.V_transpose = Transpose(data_type)
+        self.K_repeat = Repeat(data_type)
+        self.V_repeat = Repeat(data_type)
         self.K_concat = Concat(data_type)
         self.V_concat = Concat(data_type)
         self.Q_mul_K = BatchedMatmul(data_type)
@@ -489,10 +502,11 @@ class TransformerBlockAutoRegressionTP(Operator):
         h = self.n_heads
         dev_cnt = self.device_count
         d_h = d // h
+        kv_h = self.n_kv_heads
 
         # KV cache
-        K_cache = Tensor([b, h // dev_cnt, d_h, s], self.data_type)
-        V_cache = Tensor([b, h // dev_cnt, s, d_h], self.data_type)
+        K_cache = Tensor([b, kv_h // dev_cnt, d_h, s], self.data_type)
+        V_cache = Tensor([b, kv_h // dev_cnt, s, d_h], self.data_type)
 
         # multi-head attention
         q = self.Q_proj(x, self.Wq)  # [b, 1, d / dev_cnt]
@@ -500,22 +514,26 @@ class TransformerBlockAutoRegressionTP(Operator):
         k = self.K_proj(x, self.Wk)  # [b, 1, d / dev_cnt]
         v = self.V_proj(x, self.Wv)  # [b, 1, d / dev_cnt]
         q = self.Q_reshape(q, [b, 1, h // dev_cnt, d_h])
-        k = self.K_reshape(k, [b, 1, h // dev_cnt, d_h])
-        v = self.V_reshape(v, [b, 1, h // dev_cnt, d_h])
+        k = self.K_reshape(k, [b, 1, kv_h // dev_cnt, d_h])
+        v = self.V_reshape(v, [b, 1, kv_h // dev_cnt, d_h])
         q_T = self.Q_transpose(q, [0, 2, 1, 3])  # [b, h / dev_cnt, 1, d_h]
         assert q_T.shape == [b, h // dev_cnt, 1, d_h]
-        k_T = self.K_transpose(k, [0, 2, 3, 1])  # [b, h / dev_cnt, d_h, 1]
-        assert k_T.shape == [b, h // dev_cnt, d_h, 1]
-        v_T = self.V_transpose(v, [0, 2, 1, 3])  # [b, h / dev_cnt, 1, d_h]
-        assert v_T.shape == [b, h // dev_cnt, 1, d_h]
-        K_T = self.K_concat(K_cache, k_T, 3)  # [b, h / dev_cnt, d_h, s+1]
-        assert K_T.shape == [b, h // dev_cnt, d_h, s + 1]
-        V_T = self.V_concat(V_cache, v_T, 2)  # [b, h / dev_cnt, s+1, d_h]
-        assert V_T.shape == [b, h // dev_cnt, s + 1, d_h]
-        a = self.Q_mul_K(q_T, K_T)  # [b, h / dev_cnt, 1, s+1]
+        k_T = self.K_transpose(k, [0, 2, 3, 1])  # [b, kv_h / dev_cnt, d_h, 1]
+        assert k_T.shape == [b, kv_h // dev_cnt, d_h, 1]
+        v_T = self.V_transpose(v, [0, 2, 1, 3])  # [b, kv_h / dev_cnt, 1, d_h]
+        assert v_T.shape == [b, kv_h // dev_cnt, 1, d_h]
+        K_T = self.K_concat(K_cache, k_T, 3)  # [b, kv_h / dev_cnt, d_h, s+1]
+        assert K_T.shape == [b, kv_h // dev_cnt, d_h, s + 1]
+        K_R = self.K_repeat(K_T, 1, h // kv_h)  # [b, h / dev_cnt, d_h, s+1]
+        assert K_R.shape == [b, h // dev_cnt, d_h, s + 1]
+        V_T = self.V_concat(V_cache, v_T, 2)  # [b, kv_h / dev_cnt, s+1, d_h]
+        assert V_T.shape == [b, kv_h // dev_cnt, s + 1, d_h]
+        V_R = self.V_repeat(V_T, 1, h // kv_h)  # [b, h / dev_cnt, s+1, d_h]
+        assert V_R.shape == [b, h // dev_cnt, s + 1, d_h]
+        a = self.Q_mul_K(q_T, K_R)  # [b, h / dev_cnt, 1, s+1]
         assert a.shape == [b, h // dev_cnt, 1, s + 1]
         a_prob = self.A_softmax(a)
-        h0 = self.A_mul_V(a_prob, V_T)  #  [b, h / dev_cnt, 1, d_h]
+        h0 = self.A_mul_V(a_prob, V_R)  #  [b, h / dev_cnt, 1, d_h]
         assert h0.shape == [b, h // dev_cnt, 1, d_h]
         h0 = self.H_transpose(h0, [0, 2, 1, 3])  #  [b, 1, h / dev_cnt, d_h]
         assert h0.shape == [b, 1, h // dev_cnt, d_h]
@@ -576,8 +594,9 @@ class TransformerBlockAutoRegressionTP(Operator):
         device = system.device
         interconnect = system.interconnect
 
-        qkv_latency = 3 * (
-            self.Q_proj.roofline_model(device) + device.compute_module.overhead.matmul
+        qkv_latency = (
+            self.Q_proj.roofline_model(device) + device.compute_module.overhead.matmul +
+            2 * (self.K_proj.roofline_model(device) + device.compute_module.overhead.matmul)
         )
         q_mul_k_latency = (
             self.Q_mul_K.roofline_model(device) + device.compute_module.overhead.matmul
@@ -672,8 +691,8 @@ class TransformerBlockAutoRegressionTP(Operator):
         # matmul
         # print("simulating qkv")
         qkv_latency = 3 * (
-            self.Q_proj.compile_and_simulate(pcb, compile_mode)
-            + pcb.compute_module.overhead.matmul
+            self.Q_proj.compile_and_simulate(pcb, compile_mode) + pcb.compute_module.overhead.matmul +
+            2 * (self.K_proj.compile_and_simulate(pcb, compile_mode) + pcb.compute_module.overhead.matmul)
         )
         # print("simulating q_mul_k")
         q_mul_k_latency = (
@@ -775,8 +794,8 @@ class TransformerBlockAutoRegressionTP(Operator):
     def run_on_gpu(self):
         # matmul
         qkv_latency = (
-            self.Q_proj.run_on_gpu()  # - self.Q_proj.gpu_kernel_launch_overhead()
-        ) * 3
+            self.Q_proj.run_on_gpu() + 2 * self.K_proj.run_on_gpu()
+        )
         q_mul_k_latency = (
             self.Q_mul_K.run_on_gpu()  # - self.Q_mul_K.gpu_kernel_launch_overhead()
         )

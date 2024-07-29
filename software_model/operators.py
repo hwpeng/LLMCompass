@@ -108,3 +108,27 @@ class Transpose(Operator):
         self.output_shape = [self.input_shape[i] for i in permute]
         output = Tensor(self.output_shape, self.data_type)
         return output
+
+class Repeat(Operator):
+    def __init__(self, data_type: DataType):
+        super().__init__(0, 0, 0, 0, data_type)
+        self.input_shape = None
+        self.repeat_dim = None
+        self.repeat_times = None
+
+    def __call__(self, input: Tensor, repeat_dim: int, repeat_times: int) -> Tensor:
+        self.input_shape = input.shape
+        self.repeat_dim = repeat_dim
+        self.repeat_times = repeat_times
+        self.flop_count = 0
+        self.load_count = input.size
+        self.store_count = input.size * repeat_times
+        self.io_count = self.load_count + self.store_count
+        self.peak_memory_usage = input.size
+        self.output_shape = (
+            input.shape[:repeat_dim]
+            + [input.shape[repeat_dim] * repeat_times]
+            + input.shape[repeat_dim + 1 :]
+        )
+        output = Tensor(self.output_shape, self.data_type)
+        return output
