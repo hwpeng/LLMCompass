@@ -8,29 +8,43 @@ from software_model.matmul import Matmul, BatchedMatmul
 from software_model.softmax import Softmax
 from software_model.layernorm import LayerNorm
 from software_model.gelu import GeLU
+from software_model.silu import SiLU
+from software_model.mul import Mul
 
 
 from software_model.utils import Tensor, DataType
 from software_model.communication_primitives import AllReduceMultiPCB
 from math import ceil
-from typing import List
+from typing import List, Optional
 from hardware_model.system import System
 
 
 class TransformerBlockInitComputationTP(Operator):
-    def __init__(self, d_model, n_heads, device_count, data_type: DataType):
+    def __init__(self, d_model, n_heads, device_count, data_type: DataType, activation: str = "gelu", n_kv_heads: Optional[int] = None, d_ffn: Optional[int] = None):
         super().__init__(0, 0, 0, 0, data_type)
         self.d_model = d_model
         self.n_heads = n_heads
         self.device_count = device_count
+        self.activation = activation
+        if n_kv_heads is None:
+            self.n_kv_heads = n_heads
+        else:
+            self.n_kv_heads = n_kv_heads
+        if d_ffn is None:
+            self.d_ffn = d_model * 4
+        else:
+            self.d_ffn = d_ffn
         # parameters per device
         d = d_model
         self.Wq = Tensor([d, d // device_count], data_type)
         self.Wk = Tensor([d, d // device_count], data_type)
         self.Wv = Tensor([d, d // device_count], data_type)
         self.W0 = Tensor([d // device_count, d], data_type)
-        self.W1 = Tensor([d, 4 * d // device_count], data_type)
-        self.W2 = Tensor([4 * d // device_count, d], data_type)
+        self.W1 = Tensor([d, d_ffn // device_count], data_type)
+        self.W2 = Tensor([d_ffn // device_count, d], data_type)
+        if self.activation == "silu":
+            # (swish(xw1) * (xw3)) * w3
+            self.W3 = Tensor([d, d_ffn / device_count], data_type)
         # operators per device
         # # multi-head attention
         self.Q_proj = Matmul(data_type)
@@ -53,7 +67,11 @@ class TransformerBlockInitComputationTP(Operator):
         # # feed-forward network
         self.H_matmul1 = Matmul(data_type)
         self.H_gelu = GeLU(data_type)
+        self.H_silu = SiLU(data_type)
         self.H_matmul2 = Matmul(data_type)
+        if self.activation == "silu":
+            self.swi_mul = Mul(data_type)
+            self.H_matmul3 = Matmul(data_type)
         self.layer_norm1 = LayerNorm(data_type)
         self.allreduce_ffn = AllReduceMultiPCB(data_type)
 
@@ -99,9 +117,16 @@ class TransformerBlockInitComputationTP(Operator):
             H0 = self.allreduce_mha(H0)
 
         # feed-forward network
-        H1 = self.H_matmul1(H0, self.W1)  # [b, s, 4 * d / dev_cnt]
-        assert H1.shape == [b, s, 4 * d // dev_cnt]
-        H1 = self.H_gelu(H1)
+        H1 = self.H_matmul1(H0, self.W1)  # [b, s, d_ffn / dev_cnt]
+        assert H1.shape == [b, s, self.d_ffn // dev_cnt]
+        if self.activation == "gelu":
+            H1 = self.H_gelu(H1)
+        else:
+            # swiglu
+            # (swish(xw1) * (xw3)) * w2
+            H1 = self.H_silu(H1)
+            H3 = self.H_matmul3(H0, self.W3)
+            H1 = self.swi_mul(H1, H3)
         H2 = self.H_matmul2(H1, self.W2)  #  [b, s, d]
         assert H2.shape == [b, s, d]
         H2 = self.layer_norm1(H2)
@@ -136,6 +161,10 @@ class TransformerBlockInitComputationTP(Operator):
             self.H_matmul2.roofline_model(device)
             + device.compute_module.overhead.matmul
         )
+        if self.activation == "silu":
+            h3_matmul3_latency = h1_matmul1_latency
+        else:
+            h3_matmul3_latency = 0
 
         matmul_total_latency = (
             qkv_latency
@@ -144,6 +173,7 @@ class TransformerBlockInitComputationTP(Operator):
             + h_matmul0_latency
             + h1_matmul1_latency
             + h2_matmul2_latency
+            + h3_matmul3_latency
         )
 
         # normalization
@@ -158,10 +188,17 @@ class TransformerBlockInitComputationTP(Operator):
 
         normlization_total_latency = softmax_latency + layernorm_latency * 2
 
-        # gelu
-        gelu_latency = (
-            self.H_gelu.roofline_model(device) + device.compute_module.overhead.gelu
-        )
+        if self.activation == "gelu":
+            # gelu
+            act_latency = (
+                self.H_gelu.roofline_model(device) + device.compute_module.overhead.gelu
+            )
+            swi_mul_latency = 0
+        else:
+            act_latency = (
+                self.H_silu.roofline_model(device) + device.compute_module.overhead.gelu
+            )
+            swi_mul_latency = (self.swi_mul.roofline_model(device))
 
         # allreduce
         if self.device_count > 1:
@@ -176,17 +213,18 @@ class TransformerBlockInitComputationTP(Operator):
         # print
         print("Roofline breakdown:")
         print(
-            f"{qkv_latency}\n{q_mul_k_latency}\n{a_mul_v_latency}\n{h_matmul0_latency}\n{h1_matmul1_latency}\n{h2_matmul2_latency}\n{softmax_latency}\n{layernorm_latency}\n{layernorm_latency}\n{gelu_latency}\n{allreduce_latency}\n{allreduce_latency}\n"
+            f"{qkv_latency}\n{q_mul_k_latency}\n{a_mul_v_latency}\n{h_matmul0_latency}\n{h1_matmul1_latency}\n{h2_matmul2_latency}\n{softmax_latency}\n{layernorm_latency}\n{layernorm_latency}\n{act_latency}\n{allreduce_latency}\n{allreduce_latency}\n"
         )
-        self.roofline_log = f"{qkv_latency}, {q_mul_k_latency}, {a_mul_v_latency}, {h_matmul0_latency}, {h1_matmul1_latency}, {h2_matmul2_latency}, {softmax_latency}, {layernorm_latency}, {layernorm_latency}, {gelu_latency}, {allreduce_latency}, {allreduce_latency}"
+        self.roofline_log = f"{qkv_latency}, {q_mul_k_latency}, {a_mul_v_latency}, {h_matmul0_latency}, {h1_matmul1_latency}, {h2_matmul2_latency}, {h3_matmul3_latency}, {swi_mul_latency}, {softmax_latency}, {layernorm_latency}, {layernorm_latency}, {act_latency}, {allreduce_latency}, {allreduce_latency}"
         print("total:")
         print(
-            f"{matmul_total_latency}\n{normlization_total_latency}\n{gelu_latency}\n{allreduce_total_latency}\n"
+            f"{matmul_total_latency}\n{normlization_total_latency}\n{act_latency}\n{allreduce_total_latency}\n"
         )
         self.roofline_latency = (
             matmul_total_latency
             + normlization_total_latency
-            + gelu_latency
+            + act_latency
+            + swi_mul_latency
             + allreduce_total_latency
         )
         return self.roofline_latency
@@ -226,6 +264,11 @@ class TransformerBlockInitComputationTP(Operator):
             self.H_matmul2.compile_and_simulate(device, compile_mode)
             + device.compute_module.overhead.matmul
         )
+        if self.activation == "silu":
+            print("simulating h3_matmul3")
+            h3_matmul3_latency = h1_matmul1_latency
+        else:
+            h3_matmul3_latency = 0
         print("finish matmul simulation")
 
         matmul_total_latency = (
@@ -235,6 +278,7 @@ class TransformerBlockInitComputationTP(Operator):
             + h_matmul0_latency
             + h1_matmul1_latency
             + h2_matmul2_latency
+            + h3_matmul3_latency
         )
 
         # normalization
@@ -249,11 +293,19 @@ class TransformerBlockInitComputationTP(Operator):
 
         normlization_total_latency = softmax_latency + layernorm_latency * 2
 
-        # gelu
-        gelu_latency = (
-            self.H_gelu.compile_and_simulate(device, compile_mode)
-            + device.compute_module.overhead.gelu
-        )
+        if self.activation == "gelu":
+            # gelu
+            act_latency = (
+                self.H_gelu.compile_and_simulate(device, compile_mode)
+                + device.compute_module.overhead.gelu
+            )
+            swi_mul_latency = 0
+        else:
+            act_latency = (
+                self.H_silu.compile_and_simulate(device, compile_mode)
+                + device.compute_module.overhead.gelu
+            )
+            swi_mul_latency = (self.swi_mul.compile_and_simulate(device, compile_mode))
 
         # allreduce
         if self.device_count > 1:
@@ -277,10 +329,11 @@ class TransformerBlockInitComputationTP(Operator):
         self.latency = (
             matmul_total_latency
             + normlization_total_latency
-            + gelu_latency
+            + act_latency
             + allreduce_total_latency
+            + swi_mul_latency
         )
-        self.simluate_log = f"{qkv_latency}, {q_mul_k_latency}, {a_mul_v_latency}, {h_matmul0_latency}, {h1_matmul1_latency}, {h2_matmul2_latency}, {softmax_latency}, {layernorm_latency}, {layernorm_latency}, {gelu_latency}, {allreduce_latency}, {allreduce_latency}"
+        self.simluate_log = f"{qkv_latency}, {q_mul_k_latency}, {a_mul_v_latency}, {h_matmul0_latency}, {h1_matmul1_latency}, {h2_matmul2_latency}, {h3_matmul3_latency}, {swi_mul_latency}, {softmax_latency}, {layernorm_latency}, {layernorm_latency}, {act_latency}, {allreduce_latency}, {allreduce_latency}"
         return self.latency
 
     def run_on_gpu(self):
@@ -303,6 +356,12 @@ class TransformerBlockInitComputationTP(Operator):
         h2_matmul2_latency = (
             self.H_matmul2.run_on_gpu()  # - self.H_matmul2.gpu_kernel_launch_overhead()
         )
+        if self.activation == "silu":
+            h3_matmul3_latency = (
+                self.H_matmul3.run_on_gpu()  # - self.H_matmul3.gpu_kernel_launch_overhead()
+            )
+        else:
+            h3_matmul3_latency = 0
 
         matmul_total_latency = (
             qkv_latency
@@ -311,6 +370,7 @@ class TransformerBlockInitComputationTP(Operator):
             + h_matmul0_latency
             + h1_matmul1_latency
             + h2_matmul2_latency
+            + h3_matmul3_latency
         )
 
         # normalization
@@ -324,10 +384,17 @@ class TransformerBlockInitComputationTP(Operator):
 
         normlization_total_latency = softmax_latency + layernorm_latency * 2
 
-        # gelu
-        gelu_latency = (
-            self.H_gelu.run_on_gpu()  # - self.H_gelu.gpu_kernel_launch_overhead()
-        )
+        if self.activation == "gelu":
+            # gelu
+            act_latency = (
+                self.H_gelu.run_on_gpu()  # - self.H_gelu.gpu_kernel_launch_overhead()
+            )
+            swi_mul_latency = 0
+        else:
+            act_latency = (
+                self.H_silu.run_on_gpu()  # - self.H_silu.gpu_kernel_launch_overhead()
+            )
+            swi_mul_latency = self.swi_mul.run_on_gpu()
 
         # allreduce
         allreduce_total_latency = 0
@@ -341,31 +408,44 @@ class TransformerBlockInitComputationTP(Operator):
         )
         print("total:")
         print(
-            f"{matmul_total_latency}\n{normlization_total_latency}\n{gelu_latency}\n{allreduce_total_latency}\n"
+            f"{matmul_total_latency}\n{normlization_total_latency}\n{act_latency}\n{allreduce_total_latency}\n"
         )
         self.latency_on_gpu = (
             matmul_total_latency
             + normlization_total_latency
-            + gelu_latency
+            + act_latency
             + allreduce_total_latency
+            + swi_mul_latency
         )
         return self.latency_on_gpu
 
 
 class TransformerBlockAutoRegressionTP(Operator):
-    def __init__(self, d_model, n_heads, device_count, data_type: DataType):
+    def __init__(self, d_model, n_heads, device_count, data_type: DataType, activation: str = "gelu", n_kv_heads: Optional[int] = None, d_ffn: Optional[int] = None):
         super().__init__(0, 0, 0, 0, data_type)
         self.d_model = d_model
         self.n_heads = n_heads
         self.device_count = device_count
+        self.activation = activation
+        if n_kv_heads is None:
+            self.n_kv_heads = n_heads
+        else:
+            self.n_kv_heads = n_kv_heads
+        if d_ffn is None:
+            self.d_ffn = d_model * 4
+        else:
+            self.d_ffn = d_ffn
         # parameters per device
         d = d_model
         self.Wq = Tensor([d, d // device_count], data_type)
         self.Wk = Tensor([d, d // device_count], data_type)
         self.Wv = Tensor([d, d // device_count], data_type)
         self.W0 = Tensor([d // device_count, d], data_type)
-        self.W1 = Tensor([d, 4 * d // device_count], data_type)
-        self.W2 = Tensor([4 * d // device_count, d], data_type)
+        self.W1 = Tensor([d, self.d_ffn // device_count], data_type)
+        self.W2 = Tensor([self.d_ffn // device_count, d], data_type)
+        if self.activation == "silu":
+            # (swish(xw1) * (xw3)) * w3
+            self.W3 = Tensor([d, d_ffn / device_count], data_type)
         # operators per device
         # # multi-head attention
         self.Q_proj = Matmul(data_type)
@@ -390,7 +470,11 @@ class TransformerBlockAutoRegressionTP(Operator):
         # # feed-forward network
         self.H_matmul1 = Matmul(data_type)
         self.H_gelu = GeLU(data_type)
+        self.H_silu = SiLU(data_type)
         self.H_matmul2 = Matmul(data_type)
+        if self.activation == "silu":
+            self.swi_mul = Mul(data_type)
+            self.H_matmul3 = Matmul(data_type)
         self.layer_norm1 = LayerNorm(data_type)
         self.allreduce_ffn = AllReduceMultiPCB(data_type)
 
@@ -445,9 +529,28 @@ class TransformerBlockAutoRegressionTP(Operator):
             h0 = self.allreduce_mha(h0)
 
         # feed-forward network
-        h1 = self.H_matmul1(h0, self.W1)  # [b, 1, 4 * d / dev_cnt]
-        assert h1.shape == [b, 1, 4 * d // dev_cnt]
-        h1 = self.H_gelu(h1)
+
+        # H1 = self.H_matmul1(H0, self.W1)  # [b, s, d_ffn / dev_cnt]
+        # assert H1.shape == [b, s, self.d_ffn // dev_cnt]
+        # if self.activation == "gelu":
+        #     H1 = self.H_gelu(H1)
+        # else:
+        #     # swiglu
+        #     # (swish(xw1) * (xw3)) * w2
+        #     H1 = self.H_silu(H1)
+        #     H3 = self.H_matmul3(H0, self.W3)
+        #     H1 = self.swi_mul(H1, H3)
+
+        h1 = self.H_matmul1(h0, self.W1)  # [b, 1, d_ffn / dev_cnt]
+        assert h1.shape == [b, 1, self.d_ffn // dev_cnt]
+        if self.activation == "gelu":
+            h1 = self.H_gelu(h1)
+        else:
+            # swiglu
+            # (swish(xw1) * (xw3)) * w2
+            h1 = self.H_silu(h1)
+            h3 = self.H_matmul3(h0, self.W3)
+            h1 = self.swi_mul(h1, h3)
         h2 = self.H_matmul2(h1, self.W2)  #  [b, 1, d]
         assert h2.shape == [b, 1, d]
         h2 = self.layer_norm1(h2)
@@ -465,6 +568,8 @@ class TransformerBlockAutoRegressionTP(Operator):
             + K_cache.size * K_cache.data_type.word_size
             + V_cache.size * V_cache.data_type.word_size
         )
+        if self.activation == "silu":
+            self.memory_requirement += self.W3.size * self.W3.data_type.word_size
         return h2
 
     def roofline_model(self, system: System):
@@ -492,6 +597,10 @@ class TransformerBlockAutoRegressionTP(Operator):
             self.H_matmul2.roofline_model(device)
             + device.compute_module.overhead.matmul
         )
+        if self.activation == "silu":
+            h3_matmul3_latency = h1_matmul1_latency
+        else:
+            h3_matmul3_latency = 0
 
         matmul_total_latency = (
             qkv_latency
@@ -500,6 +609,7 @@ class TransformerBlockAutoRegressionTP(Operator):
             + h_matmul0_latency
             + h1_matmul1_latency
             + h2_matmul2_latency
+            + h3_matmul3_latency
         )
 
         # normalization
@@ -514,10 +624,17 @@ class TransformerBlockAutoRegressionTP(Operator):
 
         normlization_total_latency = softmax_latency + layernorm_latency * 2
 
-        # gelu
-        gelu_latency = (
-            self.H_gelu.roofline_model(device) + device.compute_module.overhead.gelu
-        )
+        if self.activation == "gelu":
+            # gelu
+            act_latency = (
+                self.H_gelu.roofline_model(device) + device.compute_module.overhead.gelu
+            )
+            swi_mul_latency = 0
+        else:
+            act_latency = (
+                self.H_silu.roofline_model(device) + device.compute_module.overhead.gelu
+            )
+            swi_mul_latency = (self.swi_mul.roofline_model(device))
 
         # allreduce
         if self.device_count > 1:
@@ -532,20 +649,20 @@ class TransformerBlockAutoRegressionTP(Operator):
         # print
         print("Roofline breakdown:")
         print(
-            f"{qkv_latency}\n{q_mul_k_latency}\n{a_mul_v_latency}\n{h_matmul0_latency}\n{h1_matmul1_latency}\n{h2_matmul2_latency}\n{softmax_latency}\n{layernorm_latency}\n{layernorm_latency}\n{gelu_latency}\n{allreduce_latency}\n{allreduce_latency}\n"
+            f"{qkv_latency}\n{q_mul_k_latency}\n{a_mul_v_latency}\n{h_matmul0_latency}\n{h1_matmul1_latency}\n{h2_matmul2_latency}\n{softmax_latency}\n{layernorm_latency}\n{layernorm_latency}\n{act_latency}\n{allreduce_latency}\n{allreduce_latency}\n"
         )
+        self.roofline_log = f"{qkv_latency}, {q_mul_k_latency}, {a_mul_v_latency}, {h_matmul0_latency}, {h1_matmul1_latency}, {h2_matmul2_latency}, {h3_matmul3_latency}, {swi_mul_latency}, {softmax_latency}, {layernorm_latency}, {layernorm_latency}, {act_latency}, {allreduce_latency}, {allreduce_latency}"
         print("total:")
         print(
-            f"{matmul_total_latency}\n{normlization_total_latency}\n{gelu_latency}\n{allreduce_total_latency}\n"
+            f"{matmul_total_latency}\n{normlization_total_latency}\n{act_latency}\n{allreduce_total_latency}\n"
         )
         self.roofline_latency = (
             matmul_total_latency
             + normlization_total_latency
-            + gelu_latency
+            + act_latency
+            + swi_mul_latency
             + allreduce_total_latency
         )
-        # print(f'memory requirement: {self.memory_requirement/1e9*96}GB')
-        self.roofline_log = f"{qkv_latency}, {q_mul_k_latency}, {a_mul_v_latency}, {h_matmul0_latency}, {h1_matmul1_latency}, {h2_matmul2_latency}, {softmax_latency}, {layernorm_latency}, {layernorm_latency}, {gelu_latency}, {allreduce_latency}, {allreduce_latency}"
         return self.roofline_latency
 
     def compile_and_simulate(self, system: System, compile_mode: str):
@@ -583,6 +700,11 @@ class TransformerBlockAutoRegressionTP(Operator):
             self.H_matmul2.compile_and_simulate(pcb, compile_mode)
             + pcb.compute_module.overhead.matmul
         )
+        if self.activation == "silu":
+            # print("simulating h3_matmul3")
+            h3_matmul3_latency = h1_matmul1_latency
+        else:
+            h3_matmul3_latency = 0
 
         matmul_total_latency = (
             qkv_latency
@@ -591,6 +713,7 @@ class TransformerBlockAutoRegressionTP(Operator):
             + h_matmul0_latency
             + h1_matmul1_latency
             + h2_matmul2_latency
+            + h3_matmul3_latency
         )
 
         # normalization
@@ -605,11 +728,20 @@ class TransformerBlockAutoRegressionTP(Operator):
 
         normlization_total_latency = softmax_latency + layernorm_latency * 2
 
-        # gelu
-        gelu_latency = (
-            self.H_gelu.compile_and_simulate(pcb, compile_mode)
-            + pcb.compute_module.overhead.gelu
-        )
+        if self.activation == "gelu":
+            # gelu
+            act_latency = (
+                self.H_gelu.compile_and_simulate(pcb, compile_mode)
+                + pcb.compute_module.overhead.gelu
+            )
+            swi_mul_latency = 0
+        else:
+            act_latency = (
+                self.H_silu.compile_and_simulate(pcb, compile_mode)
+                + pcb.compute_module.overhead.gelu
+            )
+            swi_mul_latency = self.swi_mul.compile_and_simulate(pcb, compile_mode)
+
 
         # allreduce
         if self.device_count > 1:
@@ -633,10 +765,11 @@ class TransformerBlockAutoRegressionTP(Operator):
         self.latency = (
             matmul_total_latency
             + normlization_total_latency
-            + gelu_latency
+            + act_latency
             + allreduce_total_latency
+            + swi_mul_latency
         )
-        self.simluate_log = f"{qkv_latency}, {q_mul_k_latency}, {a_mul_v_latency}, {h_matmul0_latency}, {h1_matmul1_latency}, {h2_matmul2_latency}, {softmax_latency}, {layernorm_latency}, {layernorm_latency}, {gelu_latency}, {allreduce_latency}, {allreduce_latency}"
+        self.simluate_log = f"{qkv_latency}, {q_mul_k_latency}, {a_mul_v_latency}, {h_matmul0_latency}, {h1_matmul1_latency}, {h2_matmul2_latency}, {h3_matmul3_latency}, {swi_mul_latency}, {softmax_latency}, {layernorm_latency}, {layernorm_latency}, {act_latency}, {allreduce_latency}, {allreduce_latency}"
         return self.latency
 
     def run_on_gpu(self):
@@ -659,6 +792,12 @@ class TransformerBlockAutoRegressionTP(Operator):
         h2_matmul2_latency = (
             self.H_matmul2.run_on_gpu()  # - self.H_matmul2.gpu_kernel_launch_overhead()
         )
+        if self.activation == "silu":
+            h3_matmul3_latency = (
+                self.H_matmul3.run_on_gpu()  # - self.H_matmul3.gpu_kernel_launch_overhead()
+            )
+        else:
+            h3_matmul3_latency = 0
 
         matmul_total_latency = (
             qkv_latency
@@ -667,6 +806,7 @@ class TransformerBlockAutoRegressionTP(Operator):
             + h_matmul0_latency
             + h1_matmul1_latency
             + h2_matmul2_latency
+            + h3_matmul3_latency
         )
 
         # normalization
@@ -680,11 +820,17 @@ class TransformerBlockAutoRegressionTP(Operator):
 
         normlization_total_latency = softmax_latency + layernorm_latency * 2
 
-        # gelu
-        gelu_latency = (
-            self.H_gelu.run_on_gpu()  # - self.H_gelu.gpu_kernel_launch_overhead()
-        )
-        # gelu_latency = max(gelu_latency, 1e-7)
+        if self.activation == "gelu":
+            # gelu
+            act_latency = (
+                self.H_gelu.run_on_gpu()  # - self.H_gelu.gpu_kernel_launch_overhead()
+            )
+            swi_mul_latency = 0
+        else:
+            act_latency = (
+                self.H_silu.run_on_gpu()  # - self.H_silu.gpu_kernel_launch_overhead()
+            )
+            swi_mul_latency = self.swi_mul.run_on_gpu()
 
         # allreduce
         allreduce_total_latency = 0
@@ -698,13 +844,14 @@ class TransformerBlockAutoRegressionTP(Operator):
         )
         print("total:")
         print(
-            f"{matmul_total_latency}\n{normlization_total_latency}\n{gelu_latency}\n{allreduce_total_latency}\n"
+            f"{matmul_total_latency}\n{normlization_total_latency}\n{act_latency}\n{allreduce_total_latency}\n"
         )
         self.latency_on_gpu = (
             matmul_total_latency
             + normlization_total_latency
-            + gelu_latency
+            + act_latency
             + allreduce_total_latency
+            + swi_mul_latency
         )
         return self.latency_on_gpu
 

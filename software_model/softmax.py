@@ -63,7 +63,7 @@ class Softmax(Operator):
         self.roofline_latency=max(self.io_count/min(pcb_module.io_module.bandwidth, pcb_module.compute_module.l2_bandwidth_per_cycle*pcb_module.compute_module.clock_freq), self.flop_count/pcb_module.compute_module.total_vector_flops)
         return self.roofline_latency
 
-    def compile_and_simulate(self, pcb_module: Device, compile_mode=None):
+    def compile_and_simulate(self, pcb_module: Device, compile_mode=None, verbose=False):
         self.computational_graph.data_type = pcb_module.compute_module.core.vector_unit.data_type
         min_cycle_count = float("inf")
         best_mapping = None
@@ -110,7 +110,9 @@ class Softmax(Operator):
         self.best_cycle_count = min_cycle_count
         self.best_latency = min_cycle_count / pcb_module.compute_module.clock_freq
         self.latency = self.best_latency
-        # self.best_mapping.display()
+        if verbose:
+            self.best_mapping.display()
+            self.simulate(self.computational_graph, self.best_mapping, pcb_module, verbose=True)
         return self.latency
 
     def simulate(
@@ -118,6 +120,7 @@ class Softmax(Operator):
         computational_graph: ComputationalGraph,
         mapping: Mapping,
         pcb_module: Device,
+        verbose=False,
     ) -> int:
         M = computational_graph.M
         N = computational_graph.N
@@ -162,6 +165,11 @@ class Softmax(Operator):
             total_cycle_count += l2_tiles[m].read_cycle_count
             total_cycle_count += l2_tiles[m].compute_cycle_count
             total_cycle_count += l2_tiles[m].write_cycle_count
+            if (m == 0) and (verbose == True):
+                read_ratio = l2_tiles[m].read_cycle_count / total_cycle_count
+                compute_ratio = l2_tiles[m].compute_cycle_count / total_cycle_count
+                write_ratio = l2_tiles[m].write_cycle_count / total_cycle_count
+                print(f"Read: {read_ratio:.1%}, Compute: {compute_ratio:.1%}, Write: {write_ratio:.1%}")
         return total_cycle_count
 
     class L2TileSimulator:
