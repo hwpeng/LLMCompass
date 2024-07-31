@@ -11,6 +11,7 @@ from software_model.layernorm import LayerNorm
 from software_model.gelu import GeLU
 from software_model.silu import SiLU
 from software_model.mul import Mul
+from software_model.flashattention import FlashAttention
 
 
 from software_model.utils import Tensor, DataType
@@ -21,7 +22,7 @@ from hardware_model.system import System
 
 
 class TransformerBlockInitComputationTP(Operator):
-    def __init__(self, d_model, n_heads, device_count, data_type: DataType, activation: str = "gelu", n_kv_heads: Optional[int] = None, d_ffn: Optional[int] = None):
+    def __init__(self, d_model, n_heads, device_count, data_type: DataType, activation: str = "gelu", n_kv_heads: Optional[int] = None, d_ffn: Optional[int] = None, use_flash_attn: bool = False):
         super().__init__(0, 0, 0, 0, data_type)
         self.d_model = d_model
         self.n_heads = n_heads
@@ -35,6 +36,7 @@ class TransformerBlockInitComputationTP(Operator):
             self.d_ffn = d_model * 4
         else:
             self.d_ffn = d_ffn
+        self.use_flash_attn = use_flash_attn
         # parameters per device
         d = d_model
         d_h = d // n_heads
@@ -78,6 +80,7 @@ class TransformerBlockInitComputationTP(Operator):
             self.H_matmul3 = Matmul(data_type)
         self.layer_norm1 = LayerNorm(data_type)
         self.allreduce_ffn = AllReduceMultiPCB(data_type)
+        self.flash_attn = FlashAttention(data_type)
 
     def __call__(self, X: Tensor) -> Tensor:
         # b: batch size
@@ -109,10 +112,15 @@ class TransformerBlockInitComputationTP(Operator):
         assert V_T.shape == [b, kv_h // dev_cnt, s, d_h]
         V_R = self.V_repeat(V_T, 1, h // kv_h) # [b, h / dev_cnt, s, d_h]
         assert V_R.shape == [b, h // dev_cnt, s, d_h]
-        A = self.Q_mul_K(Q_T, K_R)  # [b, h / dev_cnt, s, s]
-        assert A.shape == [b, h // dev_cnt, s, s]
-        A_prob = self.A_softmax(A)
-        H = self.A_mul_V(A_prob, V_R)  #  [b, h / dev_cnt, s, d_h]
+        if not self.use_flash_attn:
+            A = self.Q_mul_K(Q_T, K_R)  # [b, h / dev_cnt, s, s]
+            assert A.shape == [b, h // dev_cnt, s, s]
+            A_prob = self.A_softmax(A)
+            H = self.A_mul_V(A_prob, V_R)  #  [b, h / dev_cnt, s, d_h]
+        else:
+            H = self.flash_attn(Q_T, K_T, V_T, 0)
+        print(H.shape)
+        print([b, h // dev_cnt, s, d_h])
         assert H.shape == [b, h // dev_cnt, s, d_h]
         H = self.H_transpose(H, [0, 2, 1, 3])  #  [b, s, h / dev_cnt, d_h]
         assert H.shape == [b, s, h // dev_cnt, d_h]
@@ -149,16 +157,28 @@ class TransformerBlockInitComputationTP(Operator):
         device = system.device
         interconnect = system.interconnect
 
+        # pre-run, will grab components later as this is a fused kernel
+        if self.use_flash_attn:
+            self.flash_attn.roofline_model(device)
+
         qkv_latency = (
             self.Q_proj.roofline_model(device) + device.compute_module.overhead.matmul +
             2 * (self.K_proj.roofline_model(device) + device.compute_module.overhead.matmul)
         )
-        q_mul_k_latency = (
-            self.Q_mul_K.roofline_model(device) + device.compute_module.overhead.matmul
-        )
-        a_mul_v_latency = (
-            self.A_mul_V.roofline_model(device) + device.compute_module.overhead.matmul
-        )
+        if not self.use_flash_attn:
+            q_mul_k_latency = (
+                self.Q_mul_K.roofline_model(device) + device.compute_module.overhead.matmul
+            )
+            a_mul_v_latency = (
+                self.A_mul_V.roofline_model(device) + device.compute_module.overhead.matmul
+            )
+        else:
+            q_mul_k_latency = (
+                self.flash_attn.q_mul_k_lat + device.compute_module.overhead.matmul
+            )
+            a_mul_v_latency = (
+                self.flash_attn.a_mul_v_lat + device.compute_module.overhead.matmul
+            )
         h_matmul0_latency = (
             self.H_matmul0.roofline_model(device)
             + device.compute_module.overhead.matmul
@@ -187,10 +207,16 @@ class TransformerBlockInitComputationTP(Operator):
         )
 
         # normalization
-        softmax_latency = (
-            self.A_softmax.roofline_model(device)
-            + device.compute_module.overhead.softmax
-        )
+        if not self.use_flash_attn:
+            softmax_latency = (
+                self.A_softmax.roofline_model(device)
+                + device.compute_module.overhead.softmax
+            )
+        else:
+            softmax_latency = (
+                self.flash_attn.softmax_lat
+                + device.compute_module.overhead.softmax
+            )
         layernorm_latency = (
             self.layer_norm0.roofline_model(device)
             + device.compute_module.overhead.layernorm
@@ -215,7 +241,7 @@ class TransformerBlockInitComputationTP(Operator):
             allreduce_latency = self.allreduce_mha.simulate(interconnect)
             allreduce_total_latency = allreduce_latency * 2
         else:
-            allreduce_total_latency = 0
+            allreduce_latency = 0
             allreduce_total_latency = 0
 
         # others
@@ -243,22 +269,37 @@ class TransformerBlockInitComputationTP(Operator):
         device = system.device
         interconnect = system.interconnect
 
+        # pre-run, will grab components later as this is a fused kernel
+        if self.use_flash_attn:
+            print("simulating flash_attn")
+            self.flash_attn.compile_and_simulate(device, compile_mode)
+
         # matmul
         print("simulating qkv")
         qkv_latency = (
             self.Q_proj.compile_and_simulate(device, compile_mode) + device.compute_module.overhead.matmul +
             2 * (self.K_proj.compile_and_simulate(device, compile_mode) + device.compute_module.overhead.matmul)
         )
-        print("simulating q_mul_k")
-        q_mul_k_latency = (
-            self.Q_mul_K.compile_and_simulate(device, compile_mode)
-            + device.compute_module.overhead.matmul
-        )
-        print("simulating a_mul_v")
-        a_mul_v_latency = (
-            self.A_mul_V.compile_and_simulate(device, compile_mode)
-            + device.compute_module.overhead.matmul
-        )
+        if not self.use_flash_attn:
+            print("simulating q_mul_k")
+            q_mul_k_latency = (
+                self.Q_mul_K.compile_and_simulate(device, compile_mode)
+                + device.compute_module.overhead.matmul
+            )
+            print("simulating a_mul_v")
+            a_mul_v_latency = (
+                self.A_mul_V.compile_and_simulate(device, compile_mode)
+                + device.compute_module.overhead.matmul
+            )
+        else:
+            q_mul_k_latency = (
+                self.flash_attn.sim_q_mul_k_lat
+                + device.compute_module.overhead.matmul
+            )
+            a_mul_v_latency = (
+                self.flash_attn.sim_a_mul_v_lat
+                + device.compute_module.overhead.matmul
+            )
         print("simulating h_matmul0")
         h_matmul0_latency = (
             self.H_matmul0.compile_and_simulate(device, compile_mode)
@@ -292,10 +333,16 @@ class TransformerBlockInitComputationTP(Operator):
         )
 
         # normalization
-        softmax_latency = (
-            self.A_softmax.compile_and_simulate(device, compile_mode)
-            + device.compute_module.overhead.softmax
-        )
+        if not self.use_flash_attn:
+            softmax_latency = (
+                self.A_softmax.compile_and_simulate(device, compile_mode)
+                + device.compute_module.overhead.softmax
+            )
+        else:
+            softmax_latency = (
+                self.flash_attn.sim_softmax_lat
+                + device.compute_module.overhead.softmax
+            )
         layernorm_latency = (
             self.layer_norm0.compile_and_simulate(device, compile_mode)
             + device.compute_module.overhead.layernorm
@@ -347,6 +394,9 @@ class TransformerBlockInitComputationTP(Operator):
         return self.latency
 
     def run_on_gpu(self):
+        if self.use_flash_attn:
+            raise RuntimeError("FlashAttention is not supported on GPU")
+
         # matmul
         qkv_latency = (
             self.Q_proj.run_on_gpu() + 2 * self.K_proj.run_on_gpu()
@@ -431,7 +481,7 @@ class TransformerBlockInitComputationTP(Operator):
 
 
 class TransformerBlockAutoRegressionTP(Operator):
-    def __init__(self, d_model, n_heads, device_count, data_type: DataType, activation: str = "gelu", n_kv_heads: Optional[int] = None, d_ffn: Optional[int] = None):
+    def __init__(self, d_model, n_heads, device_count, data_type: DataType, activation: str = "gelu", n_kv_heads: Optional[int] = None, d_ffn: Optional[int] = None, use_flash_attn: bool = False):
         super().__init__(0, 0, 0, 0, data_type)
         self.d_model = d_model
         self.n_heads = n_heads
@@ -445,6 +495,7 @@ class TransformerBlockAutoRegressionTP(Operator):
             self.d_ffn = d_model * 4
         else:
             self.d_ffn = d_ffn
+        self.use_flash_attn = use_flash_attn
         # parameters per device
         d = d_model
         d_h = d // n_heads
@@ -490,6 +541,7 @@ class TransformerBlockAutoRegressionTP(Operator):
             self.H_matmul3 = Matmul(data_type)
         self.layer_norm1 = LayerNorm(data_type)
         self.allreduce_ffn = AllReduceMultiPCB(data_type)
+        self.flash_attn = FlashAttention(data_type)
 
     def __call__(self, x: Tensor, seq_len: int) -> Tensor:
         # b: batch size
@@ -516,24 +568,27 @@ class TransformerBlockAutoRegressionTP(Operator):
         q = self.Q_reshape(q, [b, 1, h // dev_cnt, d_h])
         k = self.K_reshape(k, [b, 1, kv_h // dev_cnt, d_h])
         v = self.V_reshape(v, [b, 1, kv_h // dev_cnt, d_h])
-        q_T = self.Q_transpose(q, [0, 2, 1, 3])  # [b, h / dev_cnt, 1, d_h]
-        assert q_T.shape == [b, h // dev_cnt, 1, d_h]
-        k_T = self.K_transpose(k, [0, 2, 3, 1])  # [b, kv_h / dev_cnt, d_h, 1]
-        assert k_T.shape == [b, kv_h // dev_cnt, d_h, 1]
-        v_T = self.V_transpose(v, [0, 2, 1, 3])  # [b, kv_h / dev_cnt, 1, d_h]
-        assert v_T.shape == [b, kv_h // dev_cnt, 1, d_h]
-        K_T = self.K_concat(K_cache, k_T, 3)  # [b, kv_h / dev_cnt, d_h, s+1]
-        assert K_T.shape == [b, kv_h // dev_cnt, d_h, s + 1]
-        K_R = self.K_repeat(K_T, 1, h // kv_h)  # [b, h / dev_cnt, d_h, s+1]
-        assert K_R.shape == [b, h // dev_cnt, d_h, s + 1]
-        V_T = self.V_concat(V_cache, v_T, 2)  # [b, kv_h / dev_cnt, s+1, d_h]
-        assert V_T.shape == [b, kv_h // dev_cnt, s + 1, d_h]
-        V_R = self.V_repeat(V_T, 1, h // kv_h)  # [b, h / dev_cnt, s+1, d_h]
-        assert V_R.shape == [b, h // dev_cnt, s + 1, d_h]
-        a = self.Q_mul_K(q_T, K_R)  # [b, h / dev_cnt, 1, s+1]
-        assert a.shape == [b, h // dev_cnt, 1, s + 1]
-        a_prob = self.A_softmax(a)
-        h0 = self.A_mul_V(a_prob, V_R)  #  [b, h / dev_cnt, 1, d_h]
+        if not self.use_flash_attn:
+            q_T = self.Q_transpose(q, [0, 2, 1, 3])  # [b, h / dev_cnt, 1, d_h]
+            assert q_T.shape == [b, h // dev_cnt, 1, d_h]
+            k_T = self.K_transpose(k, [0, 2, 3, 1])  # [b, kv_h / dev_cnt, d_h, 1]
+            assert k_T.shape == [b, kv_h // dev_cnt, d_h, 1]
+            v_T = self.V_transpose(v, [0, 2, 1, 3])  # [b, kv_h / dev_cnt, 1, d_h]
+            assert v_T.shape == [b, kv_h // dev_cnt, 1, d_h]
+            K_T = self.K_concat(K_cache, k_T, 3)  # [b, kv_h / dev_cnt, d_h, s+1]
+            assert K_T.shape == [b, kv_h // dev_cnt, d_h, s + 1]
+            K_R = self.K_repeat(K_T, 1, h // kv_h)  # [b, h / dev_cnt, d_h, s+1]
+            assert K_R.shape == [b, h // dev_cnt, d_h, s + 1]
+            V_T = self.V_concat(V_cache, v_T, 2)  # [b, kv_h / dev_cnt, s+1, d_h]
+            assert V_T.shape == [b, kv_h // dev_cnt, s + 1, d_h]
+            V_R = self.V_repeat(V_T, 1, h // kv_h)  # [b, h / dev_cnt, s+1, d_h]
+            assert V_R.shape == [b, h // dev_cnt, s + 1, d_h]
+            a = self.Q_mul_K(q_T, K_R)  # [b, h / dev_cnt, 1, s+1]
+            assert a.shape == [b, h // dev_cnt, 1, s + 1]
+            a_prob = self.A_softmax(a)
+            h0 = self.A_mul_V(a_prob, V_R)  #  [b, h / dev_cnt, 1, d_h]
+        else:
+            h0 = self.flash_attn(q, k, v, s)
         assert h0.shape == [b, h // dev_cnt, 1, d_h]
         h0 = self.H_transpose(h0, [0, 2, 1, 3])  #  [b, 1, h / dev_cnt, d_h]
         assert h0.shape == [b, 1, h // dev_cnt, d_h]
@@ -594,16 +649,28 @@ class TransformerBlockAutoRegressionTP(Operator):
         device = system.device
         interconnect = system.interconnect
 
+        # pre-run, will grab components later as this is a fused kernel
+        if self.use_flash_attn:
+            self.flash_attn.roofline_model(device)
+
         qkv_latency = (
             self.Q_proj.roofline_model(device) + device.compute_module.overhead.matmul +
             2 * (self.K_proj.roofline_model(device) + device.compute_module.overhead.matmul)
         )
-        q_mul_k_latency = (
-            self.Q_mul_K.roofline_model(device) + device.compute_module.overhead.matmul
-        )
-        a_mul_v_latency = (
-            self.A_mul_V.roofline_model(device) + device.compute_module.overhead.matmul
-        )
+        if not self.use_flash_attn:
+            q_mul_k_latency = (
+                self.Q_mul_K.roofline_model(device) + device.compute_module.overhead.matmul
+            )
+            a_mul_v_latency = (
+                self.A_mul_V.roofline_model(device) + device.compute_module.overhead.matmul
+            )
+        else:
+            q_mul_k_latency = (
+                self.flash_attn.q_mul_k_lat + device.compute_module.overhead.matmul
+            )
+            a_mul_v_latency = (
+                self.flash_attn.a_mul_v_lat + device.compute_module.overhead.matmul
+            )
         h_matmul0_latency = (
             self.H_matmul0.roofline_model(device)
             + device.compute_module.overhead.matmul
@@ -632,10 +699,16 @@ class TransformerBlockAutoRegressionTP(Operator):
         )
 
         # normalization
-        softmax_latency = (
-            self.A_softmax.roofline_model(device)
-            + device.compute_module.overhead.softmax
-        )
+        if not self.use_flash_attn:
+            softmax_latency = (
+                self.A_softmax.roofline_model(device)
+                + device.compute_module.overhead.softmax
+            )
+        else:
+            softmax_latency = (
+                self.flash_attn.softmax_lat
+                + device.compute_module.overhead.softmax
+            )
         layernorm_latency = (
             self.layer_norm0.roofline_model(device)
             + device.compute_module.overhead.layernorm
@@ -688,22 +761,37 @@ class TransformerBlockAutoRegressionTP(Operator):
         pcb = system.device
         interconnect = system.interconnect
 
+        # pre-run, will grab components later as this is a fused kernel
+        if self.use_flash_attn:
+            # print("simulating flash_attn")
+            self.flash_attn.compile_and_simulate(pcb, compile_mode)
+
         # matmul
         # print("simulating qkv")
         qkv_latency = 3 * (
             self.Q_proj.compile_and_simulate(pcb, compile_mode) + pcb.compute_module.overhead.matmul +
             2 * (self.K_proj.compile_and_simulate(pcb, compile_mode) + pcb.compute_module.overhead.matmul)
         )
-        # print("simulating q_mul_k")
-        q_mul_k_latency = (
-            self.Q_mul_K.compile_and_simulate(pcb, compile_mode)
-            + pcb.compute_module.overhead.matmul
-        )
-        # print("simulating a_mul_v")
-        a_mul_v_latency = (
-            self.A_mul_V.compile_and_simulate(pcb, compile_mode)
-            + pcb.compute_module.overhead.matmul
-        )
+        if not self.use_flash_attn:
+            # print("simulating q_mul_k")
+            q_mul_k_latency = (
+                self.Q_mul_K.compile_and_simulate(pcb, compile_mode)
+                + pcb.compute_module.overhead.matmul
+            )
+            # print("simulating a_mul_v")
+            a_mul_v_latency = (
+                self.A_mul_V.compile_and_simulate(pcb, compile_mode)
+                + pcb.compute_module.overhead.matmul
+            )
+        else:
+            q_mul_k_latency = (
+                self.flash_attn.sim_q_mul_k_lat
+                + pcb.compute_module.overhead.matmul
+            )
+            a_mul_v_latency = (
+                self.flash_attn.sim_a_mul_v_lat
+                + pcb.compute_module.overhead.matmul
+            )
         # print("simulating h_matmul0")
         h_matmul0_latency = (
             self.H_matmul0.compile_and_simulate(pcb, compile_mode)
@@ -736,10 +824,16 @@ class TransformerBlockAutoRegressionTP(Operator):
         )
 
         # normalization
-        softmax_latency = (
-            self.A_softmax.compile_and_simulate(pcb, compile_mode)
-            + pcb.compute_module.overhead.softmax
-        )
+        if not self.use_flash_attn:
+            softmax_latency = (
+                self.A_softmax.compile_and_simulate(pcb, compile_mode)
+                + pcb.compute_module.overhead.softmax
+            )
+        else:
+            softmax_latency = (
+                self.flash_attn.sim_softmax_lat
+                + pcb.compute_module.overhead.softmax
+            )
         layernorm_latency = (
             self.layer_norm0.compile_and_simulate(pcb, compile_mode)
             + pcb.compute_module.overhead.layernorm
@@ -792,6 +886,9 @@ class TransformerBlockAutoRegressionTP(Operator):
         return self.latency
 
     def run_on_gpu(self):
+        if self.use_flash_attn:
+            raise RuntimeError("FlashAttention is not supported on GPU")
+
         # matmul
         qkv_latency = (
             self.Q_proj.run_on_gpu() + 2 * self.K_proj.run_on_gpu()
