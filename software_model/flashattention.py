@@ -63,6 +63,12 @@ class FlashAttention(Operator):
             + 2 * Tc * m_size  # ld/st
         )
 
+        q_mul_k_io_count = K_size + Tc * Q_size
+        p_mul_v_io_count = V_size + Tc * O_size
+        softmax_io_count = 2 * Tc * l_size + 2 * Tc * m_size + Tc * O_size
+
+        assert self.io_count == (q_mul_k_io_count + p_mul_v_io_count + softmax_io_count)
+
         io_bw = min(
             pcb_module.io_module.bandwidth,
             pcb_module.compute_module.l2_bandwidth_per_cycle
@@ -97,10 +103,9 @@ class FlashAttention(Operator):
 
         if io_bound_latency > comp_bound_latency:
             self.roofline_latency = io_bound_latency
-            # TODO
-            self.q_mul_k_lat = 0.0
-            self.a_mul_v_lat = 0.0
-            self.softmax_lat = 0.0
+            self.q_mul_k_lat = q_mul_k_io_count / io_bw
+            self.a_mul_v_lat = p_mul_v_io_count / io_bw
+            self.softmax_lat = softmax_io_count / io_bw
         else:
             self.roofline_latency = comp_bound_latency
             self.q_mul_k_lat = q_mul_k_flops / pcb_module.compute_module.total_systolic_array_flops
