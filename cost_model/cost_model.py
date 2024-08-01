@@ -13,6 +13,7 @@ import cost_model.supply_chain.supply_chain_model as scm
 transistor_density_7nm = scm.transistor_density_arr[scm.PN_7_INDEX]
 transistor_density_6nm = 114.2
 transistor_density_5nm = scm.transistor_density_arr[scm.PN_5_INDEX]
+transistor_density_4nm = 98.28 # H100 has 80 B transistors on 814 mm2
 
 sram_bit_cell_density_7nm = 1.70e-07
 sram_bit_cell_density_6nm = 1.40e-07
@@ -192,6 +193,8 @@ def find_logic_sram_transistor_density(process_node):
         return transistor_density_6nm, sram_bit_cell_density_6nm
     elif '5' in process_node:
         return transistor_density_5nm, sram_bit_cell_density_5nm
+    elif '4' in process_node:
+        return transistor_density_4nm, sram_bit_cell_density_5nm
 
     raise Exception("Invalid Process Node")
 
