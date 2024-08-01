@@ -111,7 +111,7 @@ class FlashAttention(Operator):
 
     def compile_and_simulate(self, pcb_module: Device, compile_mode: str = ""):
         # TODO: Implement compile and simulate for FlashAttention
-        self.latency = self.roofline_latency(pcb_module)
+        self.latency = self.roofline_model(pcb_module)
         self.sim_q_mul_k_lat = self.q_mul_k_lat
         self.sim_a_mul_v_lat = self.a_mul_v_lat
         self.sim_softmax_lat = self.softmax_lat

@@ -119,8 +119,8 @@ class TransformerBlockInitComputationTP(Operator):
             H = self.A_mul_V(A_prob, V_R)  #  [b, h / dev_cnt, s, d_h]
         else:
             H = self.flash_attn(Q_T, K_T, V_T, 0)
-        print(H.shape)
-        print([b, h // dev_cnt, s, d_h])
+        # print(H.shape)
+        # print([b, h // dev_cnt, s, d_h])
         assert H.shape == [b, h // dev_cnt, s, d_h]
         H = self.H_transpose(H, [0, 2, 1, 3])  #  [b, s, h / dev_cnt, d_h]
         assert H.shape == [b, s, h // dev_cnt, d_h]
