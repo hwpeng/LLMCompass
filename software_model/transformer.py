@@ -568,13 +568,13 @@ class TransformerBlockAutoRegressionTP(Operator):
         q = self.Q_reshape(q, [b, 1, h // dev_cnt, d_h])
         k = self.K_reshape(k, [b, 1, kv_h // dev_cnt, d_h])
         v = self.V_reshape(v, [b, 1, kv_h // dev_cnt, d_h])
+        q_T = self.Q_transpose(q, [0, 2, 1, 3])  # [b, h / dev_cnt, 1, d_h]
+        assert q_T.shape == [b, h // dev_cnt, 1, d_h]
+        k_T = self.K_transpose(k, [0, 2, 3, 1])  # [b, kv_h / dev_cnt, d_h, 1]
+        assert k_T.shape == [b, kv_h // dev_cnt, d_h, 1]
+        v_T = self.V_transpose(v, [0, 2, 1, 3])  # [b, kv_h / dev_cnt, 1, d_h]
+        assert v_T.shape == [b, kv_h // dev_cnt, 1, d_h]
         if not self.use_flash_attn:
-            q_T = self.Q_transpose(q, [0, 2, 1, 3])  # [b, h / dev_cnt, 1, d_h]
-            assert q_T.shape == [b, h // dev_cnt, 1, d_h]
-            k_T = self.K_transpose(k, [0, 2, 3, 1])  # [b, kv_h / dev_cnt, d_h, 1]
-            assert k_T.shape == [b, kv_h // dev_cnt, d_h, 1]
-            v_T = self.V_transpose(v, [0, 2, 1, 3])  # [b, kv_h / dev_cnt, 1, d_h]
-            assert v_T.shape == [b, kv_h // dev_cnt, 1, d_h]
             K_T = self.K_concat(K_cache, k_T, 3)  # [b, kv_h / dev_cnt, d_h, s+1]
             assert K_T.shape == [b, kv_h // dev_cnt, d_h, s + 1]
             K_R = self.K_repeat(K_T, 1, h // kv_h)  # [b, h / dev_cnt, d_h, s+1]
@@ -588,7 +588,7 @@ class TransformerBlockAutoRegressionTP(Operator):
             a_prob = self.A_softmax(a)
             h0 = self.A_mul_V(a_prob, V_R)  #  [b, h / dev_cnt, 1, d_h]
         else:
-            h0 = self.flash_attn(q, k, v, s)
+            h0 = self.flash_attn(q_T, k_T, v_T, s)
         assert h0.shape == [b, h // dev_cnt, 1, d_h]
         h0 = self.H_transpose(h0, [0, 2, 1, 3])  #  [b, 1, h / dev_cnt, d_h]
         assert h0.shape == [b, 1, h // dev_cnt, d_h]

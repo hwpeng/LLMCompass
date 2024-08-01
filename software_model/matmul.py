@@ -12,6 +12,7 @@ import pandas as pd
 import os
 from scalesim.scale_sim import scalesim
 import copy
+import multiprocessing
 
 
 class BatchedMatmul(Operator):
@@ -20,6 +21,8 @@ class BatchedMatmul(Operator):
         self.input1_shape = None
         self.input2_shape = None
         self.output_shape = None
+        self.best_mapping1 = None
+        self.best_mapping2 = None
 
     def __call__(self, input1: Tensor, input2: Tensor) -> Tensor:
         # [b, M, K] * [b, K, N] = [b, M, N]
@@ -60,6 +63,7 @@ class BatchedMatmul(Operator):
         matmul_latency1 = (
             matmul.compile_and_simulate(pcb_module, compile_mode) * self.bs
         )
+        self.best_mapping1 = copy.deepcopy(matmul.best_mapping)
 
         matmul = Matmul(self.data_type)
         _ = matmul(
@@ -73,6 +77,7 @@ class BatchedMatmul(Operator):
             * self.data_type.word_size
             / pcb_module.io_module.bandwidth
         )
+        self.best_mapping2 = copy.deepcopy(matmul.best_mapping)
         self.latency = min(matmul_latency1, matmul_latency2)
         return self.latency
 
@@ -100,6 +105,21 @@ class BatchedMatmul(Operator):
             # min(latencies) - 8e-6
         )  # GPU launch kernel overhead and PyTorch overhead
         return self.latency_on_gpu
+    
+    def run_given_mapping(self, device: Device, mapping1, mapping2):
+        matmul = Matmul(self.data_type)
+        _ = matmul(Tensor([self.M, self.K]), Tensor([self.K, self.N]))
+        matmul_latency1 = matmul.run_given_mapping(device, self.best_mapping1) * self.bs
+
+        matmul = Matmul(self.data_type)
+        _ = matmul(
+            Tensor([self.M, self.K * self.bs]), Tensor([self.K * self.bs, self.N])
+        )
+        matmul_latency2 = matmul.run_given_mapping(device, self.best_mapping2) 
+        matmul_latency2 += (self.bs - 1) * self.M * self.N * self.data_type.word_size / device.io_module.bandwidth
+
+        self.latency = min(matmul_latency1, matmul_latency2)
+        return self.latency
 
     @staticmethod
     def gpu_kernel_launch_overhead():
@@ -162,6 +182,11 @@ class Matmul(Operator):
             ),
         )
         return self.roofline_latency
+    
+    def run_given_mapping(self, device: Device, mapping) -> float:
+        cycle_count = self.simulate(self.computational_graph, mapping, device)
+        latency = cycle_count / device.compute_module.clock_freq
+        return latency
 
     def print_latency(self):
         print(
@@ -728,6 +753,110 @@ class Matmul(Operator):
                         if cycle_count < min_cycle_count:
                             min_cycle_count = cycle_count
                             best_mapping = mapping
+        elif compile_mode == "heuristic-GPU-fast":
+            i = 0
+            all_mappings = []
+            for l2_tile_M in [64, 128, 256, 512, 1024, 2048]:
+                for l2_tile_N in [l2_tile_M // 2, l2_tile_M, l2_tile_M * 2]:
+                    if K <= 12288:
+                        l2_K_tiling_factor_list = [1, 2, 4, 8]
+                    else:
+                        l2_K_tiling_factor_list = [
+                            K // 1024,
+                            K // 2048,
+                            K // 4096,
+                            K // 8192,
+                        ]
+                    for l2_K_tiling_factor in l2_K_tiling_factor_list:
+                        l2_tile_K = ceil(
+                            self.computational_graph.K / l2_K_tiling_factor
+                        )
+                        l2_tile_K = 2 ** floor(log2(l2_tile_K))
+                        working_set_size = (
+                            l2_tile_N * l2_tile_K
+                            + l2_tile_M * l2_tile_K
+                            + l2_tile_M * l2_tile_N
+                        )
+                        if (
+                            working_set_size
+                            > pcb_module.compute_module.l2_size
+                            // self.data_type.word_size
+                        ):
+                            continue
+                        elif (
+                            working_set_size
+                            <= pcb_module.compute_module.l2_size
+                            // self.data_type.word_size
+                            // 2
+                        ):
+                            is_l2_double_buffering = True
+                        else:
+                            is_l2_double_buffering = False
+
+                        for l1_tile_M in [32, 64, 128, 256]:
+                            if l1_tile_M > min(l2_tile_M, l2_tile_N):
+                                continue
+                            l1_tile_N = l1_tile_M
+                            for l1_K_tiling_factor in [1, 2, 4, 8, 16, 32]:
+                                l1_tile_K = ceil(l2_tile_K / l1_K_tiling_factor)
+                                if (
+                                    l1_tile_M * l1_tile_N
+                                    + l1_tile_N * l1_tile_K
+                                    + l1_tile_M * l1_tile_K
+                                    > pcb_module.compute_module.core.SRAM_size
+                                    // self.data_type.word_size
+                                    // 2
+                                ):
+                                    continue
+                                l2_loop_order = "knm"
+                                l1_loop_order = "knm"
+                                for (
+                                    l0_M_tiling_factor,
+                                    l0_N_tiling_factor,
+                                    l0_K_tiling_factor,
+                                ) in self.find_permutations(
+                                    pcb_module.compute_module.core.systolic_array_count
+                                ):
+                                    i += 1
+                                    start = time.time()
+                                    mapping = self.Mapping(
+                                        l2_tile_M,
+                                        l2_tile_N,
+                                        l2_tile_K,
+                                        is_l2_double_buffering,
+                                        l1_tile_M,
+                                        l1_tile_N,
+                                        l1_tile_K,
+                                        l2_loop_order,
+                                        l1_loop_order,
+                                        l0_M_tiling_factor,
+                                        l0_N_tiling_factor,
+                                        l0_K_tiling_factor,
+                                    )
+                                    all_mappings.append(mapping)
+                                    # cycle_count = self.simulate(
+                                    #     self.computational_graph,
+                                    #     mapping,
+                                    #     pcb_module,
+                                    # )
+                                    # end = time.time()
+                                    # if i % 1000 == 0:
+                                    #     print(f"{i} simulation time: {end-start}")
+                                    # if cycle_count < min_cycle_count:
+                                    #     min_cycle_count = cycle_count
+                                    #     best_mapping = mapping
+            # simulate all mappings using multiprocessing
+            # print(f"Total mappings: {len(all_mappings)}")
+            num_cores = multiprocessing.cpu_count()
+            with multiprocessing.Pool(num_cores) as pool:
+                cycle_counts = pool.starmap(
+                    self.simulate,
+                    [(self.computational_graph, mapping, pcb_module) for mapping in all_mappings],
+                )
+                for i, cycle_count in enumerate(cycle_counts):
+                    if cycle_count < min_cycle_count:
+                        min_cycle_count = cycle_count
+                        best_mapping = all_mappings[i]
         else:
             raise ValueError(f"compile_mode {compile_mode} not supported")
         self.best_mapping = best_mapping
