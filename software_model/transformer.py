@@ -768,7 +768,7 @@ class TransformerBlockAutoRegressionTP(Operator):
 
         # matmul
         # print("simulating qkv")
-        qkv_latency = 3 * (
+        qkv_latency = (
             self.Q_proj.compile_and_simulate(pcb, compile_mode) + pcb.compute_module.overhead.matmul +
             2 * (self.K_proj.compile_and_simulate(pcb, compile_mode) + pcb.compute_module.overhead.matmul)
         )

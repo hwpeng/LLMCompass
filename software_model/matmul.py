@@ -1412,6 +1412,8 @@ class Matmul(Operator):
                 ].item()
             except KeyError:
                 # print('not found in look up table')
+                if os.path.exists("./systolic_array_model/temp/") is False:
+                    os.makedirs("./systolic_array_model/temp/")
                 config = f"./systolic_array_model/temp/systolic_array_{os.getpid()}.cfg"
                 with open(config, "w") as f:
                     f.writelines("[general]\n")
