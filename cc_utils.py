@@ -240,7 +240,7 @@ def sim_prefill_fast(llm: str, hw_name: str, device_count: int, input_lens: list
                 else:
                     allreduce_latency = 0
                 
-                prefill_latency = qkv_latency + h_matmul0_latency + h1_matmul1_latency + h2_matmul2_latency + h3_matmul3_latency + swi_mul_latency + softmax_latency + layernorm_latency * 2 + act_latency + allreduce_latency * 2
+                prefill_latency = qkv_latency + q_mul_k_latency + a_mul_v_latency + h_matmul0_latency + h1_matmul1_latency + h2_matmul2_latency + h3_matmul3_latency + swi_mul_latency + softmax_latency + layernorm_latency * 2 + act_latency + allreduce_latency * 2
             latency_breakdown = Latency(
                 qkv_proj=float(qkv_latency) * n_layers,
                 q_mul_k=float(q_mul_k_latency) * n_layers,
@@ -351,7 +351,7 @@ def sim_decode_fast(llm: str, hw_name: str, device_count: int, input_lens: list,
                     else:
                         allreduce_latency = 0
 
-                    decode_latency = qkv_latency + h_matmul0_latency + h1_matmul1_latency + h2_matmul2_latency + h3_matmul3_latency + swi_mul_latency + softmax_latency + layernorm_latency * 2 + act_latency + allreduce_latency * 2
+                    decode_latency = qkv_latency + q_mul_k_latency + a_mul_v_latency + h_matmul0_latency + h1_matmul1_latency + h2_matmul2_latency + h3_matmul3_latency + swi_mul_latency + softmax_latency + layernorm_latency * 2 + act_latency + allreduce_latency * 2
                 latency_breakdown = Latency(
                     qkv_proj=float(qkv_latency) * n_layers * output_len,
                     q_mul_k=float(q_mul_k_latency) * n_layers * output_len,
