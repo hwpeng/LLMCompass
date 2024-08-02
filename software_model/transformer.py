@@ -22,7 +22,7 @@ from hardware_model.system import System
 
 
 class TransformerBlockInitComputationTP(Operator):
-    def __init__(self, d_model, n_heads, device_count, data_type: DataType, activation: str = "gelu", n_kv_heads: Optional[int] = None, d_ffn: Optional[int] = None, use_flash_attn: bool = False):
+    def __init__(self, d_model, n_heads, device_count, data_type: DataType, activation: str = "gelu", n_kv_heads: Optional[int] = None, d_ffn: Optional[int] = None, use_flash_attn: bool = False, use_flash_attn_xcel: bool = False, flash_attn_br: int = -1, flash_attn_bc: int = -1):
         super().__init__(0, 0, 0, 0, data_type)
         self.d_model = d_model
         self.n_heads = n_heads
@@ -37,6 +37,9 @@ class TransformerBlockInitComputationTP(Operator):
         else:
             self.d_ffn = d_ffn
         self.use_flash_attn = use_flash_attn
+        self.use_flash_attn_xcel = use_flash_attn_xcel
+        self.flash_attn_br = flash_attn_br
+        self.flash_attn_bc = flash_attn_bc
         # parameters per device
         d = d_model
         d_h = d // n_heads
@@ -80,7 +83,7 @@ class TransformerBlockInitComputationTP(Operator):
             self.H_matmul3 = Matmul(data_type)
         self.layer_norm1 = LayerNorm(data_type)
         self.allreduce_ffn = AllReduceMultiPCB(data_type)
-        self.flash_attn = FlashAttention(data_type)
+        self.flash_attn = FlashAttention(data_type, self.use_flash_attn_xcel, self.flash_attn_br, self.flash_attn_bc)
 
     def __call__(self, X: Tensor) -> Tensor:
         # b: batch size
@@ -481,7 +484,7 @@ class TransformerBlockInitComputationTP(Operator):
 
 
 class TransformerBlockAutoRegressionTP(Operator):
-    def __init__(self, d_model, n_heads, device_count, data_type: DataType, activation: str = "gelu", n_kv_heads: Optional[int] = None, d_ffn: Optional[int] = None, use_flash_attn: bool = False):
+    def __init__(self, d_model, n_heads, device_count, data_type: DataType, activation: str = "gelu", n_kv_heads: Optional[int] = None, d_ffn: Optional[int] = None, use_flash_attn: bool = False, use_flash_attn_xcel: bool = False, flash_attn_br: int = -1, flash_attn_bc: int = -1):
         super().__init__(0, 0, 0, 0, data_type)
         self.d_model = d_model
         self.n_heads = n_heads
@@ -496,6 +499,9 @@ class TransformerBlockAutoRegressionTP(Operator):
         else:
             self.d_ffn = d_ffn
         self.use_flash_attn = use_flash_attn
+        self.use_flash_attn_xcel = use_flash_attn_xcel
+        self.flash_attn_br = flash_attn_br
+        self.flash_attn_bc = flash_attn_bc
         # parameters per device
         d = d_model
         d_h = d // n_heads
@@ -541,7 +547,7 @@ class TransformerBlockAutoRegressionTP(Operator):
             self.H_matmul3 = Matmul(data_type)
         self.layer_norm1 = LayerNorm(data_type)
         self.allreduce_ffn = AllReduceMultiPCB(data_type)
-        self.flash_attn = FlashAttention(data_type)
+        self.flash_attn = FlashAttention(data_type, self.use_flash_attn_xcel, self.flash_attn_br, self.flash_attn_bc)
 
     def __call__(self, x: Tensor, seq_len: int) -> Tensor:
         # b: batch size

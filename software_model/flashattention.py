@@ -6,12 +6,22 @@ import numpy as np
 
 
 class FlashAttention(Operator):
-    def __init__(self, data_type: DataType):
+    def __init__(
+        self, data_type: DataType, use_xcel: bool = False, br: int = -1, bc: int = -1
+    ):
         super().__init__(0, 0, 0, 0, data_type)
         self.input1_shape = None
         self.input2_shape = None
         self.input3_shape = None
         self.output_shape = None
+        self.use_xcel = use_xcel
+        self.xcel_freq = 1e9
+        if use_xcel:
+            self.br = 128
+            self.bc = 128
+        else:
+            self.br = br
+            self.bc = bc
 
     def __call__(
         self, input1: Tensor, input2: Tensor, input3: Tensor, kv_len: int
@@ -40,11 +50,11 @@ class FlashAttention(Operator):
         # in decode, s == 1 so N_kv > N
 
         # KV blocking
-        Bc = ceil(M / (4 * self.d_h))
+        Bc = ceil(M / (4 * self.d_h)) if self.bc == -1 else self.bc
         Tc = ceil(N_kv / Bc)  # O( N_kv * d_h * M^-1 )
 
         # All other blocking
-        Br = min(ceil(M / (4 * self.d_h)), self.d_h)
+        Br = min(ceil(M / (4 * self.d_h)), self.d_h) if self.br == -1 else self.br
         Tr = ceil(N / Br)  # O( N * d_h * M^-1 )
 
         K_size = np.prod([self.bs, self.h, N_kv, self.d_h])
@@ -54,63 +64,152 @@ class FlashAttention(Operator):
         l_size = N
         m_size = N
 
-        self.io_count = (
-            K_size  # ld
-            + V_size  # ld
-            + Tc * Q_size  # ld
-            + 2 * Tc * O_size  # ld/st
-            + 2 * Tc * l_size  # ld/st
-            + 2 * Tc * m_size  # ld/st
-        )
-
         q_mul_k_io_count = K_size + Tc * Q_size
         p_mul_v_io_count = V_size + Tc * O_size
         softmax_io_count = 2 * Tc * l_size + 2 * Tc * m_size + Tc * O_size
-
-        assert self.io_count == (q_mul_k_io_count + p_mul_v_io_count + softmax_io_count)
+        self.io_count = q_mul_k_io_count + p_mul_v_io_count + softmax_io_count
 
         io_bw = min(
             pcb_module.io_module.bandwidth,
             pcb_module.compute_module.l2_bandwidth_per_cycle
             * pcb_module.compute_module.clock_freq,
         )
-
         io_bound_latency = self.io_count / io_bw
 
         q_mul_k_flops = self.bs * self.h * (N * N_kv * self.d_h)
         p_mul_v_flops = self.bs * self.h * (N * N_kv * self.d_h)
-        softmax_exps = self.bs * self.h * (
-            Tc
-            * Tr
-            * (
-                Br * Bc  # np.exp(sij - mij)
-                + Br  # np.exp(mi - m_new)
-                + Br  # np.exp(mij - m_new)
-                + Br  # np.exp(mi - m_new)
-                + Br  # np.exp(mij - m_new)
-            )
-        )
-
         self.flop_count = q_mul_k_flops + p_mul_v_flops
-        self.exp_count = softmax_exps
+
+        if not self.use_xcel:
+            self.xcel_cycles = 0
+            save_exps = False  # set to true to further reduce operation counting but would require more memory to store intermediate values
+            exp_only = False  # set to true to use the older model
+
+            if exp_only:
+                softmax_exps = (
+                    Br * Bc  # np.exp(sij - mij)
+                    + Br  # np.exp(mi - m_new)
+                    + Br  # np.exp(mij - m_new)
+                    + (0 if save_exps else Br)  # np.exp(mi - m_new)
+                    + (0 if save_exps else Br)  # np.exp(mij - m_new)
+                )
+                self.vec_count = (
+                    self.bs
+                    * self.h
+                    * Tc
+                    * Tr
+                    * softmax_exps
+                    * pcb_module.compute_module.core.vector_unit.flops_per_exp
+                )
+
+            else:
+                mij_flops = Br * Bc
+                pij_flops = (
+                    Br
+                    * Bc
+                    * (pcb_module.compute_module.core.vector_unit.flops_per_exp + 1)
+                )
+                lij_flops = Br * Bc
+                m_new_flops = Br
+                exp_mi_flops = Br * (
+                    pcb_module.compute_module.core.vector_unit.flops_per_exp + 1
+                )
+                exp_mi_li_flops = Br
+                exp_mij_flops = Br * (
+                    pcb_module.compute_module.core.vector_unit.flops_per_exp + 1
+                )
+                l_new_flops = 2 * Br
+                o_flops = 4 * Br * self.d_h
+                if not save_exps:
+                    o_flops += (
+                        exp_mi_flops + exp_mi_li_flops
+                    ) + exp_mij_flops  # rematerialize
+                self.vec_count = (
+                    self.bs
+                    * self.h
+                    * Tc
+                    * Tr
+                    * sum(
+                        [
+                            mij_flops,
+                            pij_flops,
+                            lij_flops,
+                            m_new_flops,
+                            exp_mi_flops,
+                            exp_mi_li_flops,
+                            exp_mij_flops,
+                            l_new_flops,
+                            o_flops,
+                        ]
+                    )
+                )
+                print("FLASHATTENTION")
+                print(f"{self.vec_count=}")
+                print(f"{self.vec_count / pcb_module.compute_module.total_vector_flops=}")
+
+        # use the xcel
+        else:
+            heads_per_core = ceil(self.h / pcb_module.compute_module.core_count)
+
+            rowmax_cycles = 7
+            exp_cycles = 1 + 7
+            rowsum_cycles = 7
+            xcel_pipeline_depth = sum(
+                [
+                    rowmax_cycles,
+                    exp_cycles,
+                    rowsum_cycles,
+                    2,  # +2 for exp_mi and exp_mij following up after sij
+                ]
+            )
+
+            self.xcel_cycles = (
+                self.bs * self.h * Tc * Tr * (Br)
+            )
+
+            self.vec_count = (
+                self.bs
+                * self.h
+                * Tc
+                * Tr
+                * sum(
+                    [
+                        3 * Br,
+                        4 * Br * self.d_h,
+                    ]
+                )
+            )
+            print("XCEL FLASHATTN")
+            print(f"{self.vec_count=}")
+            print(f"{self.xcel_cycles=}")
+            print(f"{self.vec_count / pcb_module.compute_module.total_vector_flops=}")
+            print(f"{self.xcel_cycles / (self.xcel_freq * pcb_module.compute_module.core_count)=}")
 
         comp_bound_latency = (
             self.flop_count / pcb_module.compute_module.total_systolic_array_flops
-            + self.exp_count
-            * pcb_module.compute_module.core.vector_unit.flops_per_exp
-            / pcb_module.compute_module.total_vector_flops
+            + self.vec_count / pcb_module.compute_module.total_vector_flops
+            + self.xcel_cycles / (self.xcel_freq * pcb_module.compute_module.core_count)
         )
 
         if io_bound_latency > comp_bound_latency:
+            print("IO BOUND")
             self.roofline_latency = io_bound_latency
             self.q_mul_k_lat = q_mul_k_io_count / io_bw
             self.a_mul_v_lat = p_mul_v_io_count / io_bw
             self.softmax_lat = softmax_io_count / io_bw
         else:
+            print("COMP BOUND")
             self.roofline_latency = comp_bound_latency
-            self.q_mul_k_lat = q_mul_k_flops / pcb_module.compute_module.total_systolic_array_flops
-            self.a_mul_v_lat = p_mul_v_flops / pcb_module.compute_module.total_systolic_array_flops
-            self.softmax_lat = self.exp_count * pcb_module.compute_module.core.vector_unit.flops_per_exp / pcb_module.compute_module.total_vector_flops
+            self.q_mul_k_lat = (
+                q_mul_k_flops / pcb_module.compute_module.total_systolic_array_flops
+            )
+            self.a_mul_v_lat = (
+                p_mul_v_flops / pcb_module.compute_module.total_systolic_array_flops
+            )
+            self.softmax_lat = (
+                self.vec_count / pcb_module.compute_module.total_vector_flops
+                + self.xcel_cycles / (self.xcel_freq * pcb_module.compute_module.core_count)
+            )
 
         return self.roofline_latency
 
