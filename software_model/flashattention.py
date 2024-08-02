@@ -149,22 +149,18 @@ class FlashAttention(Operator):
 
         # use the xcel
         else:
-            heads_per_core = ceil(self.h / pcb_module.compute_module.core_count)
-
             rowmax_cycles = 7
-            exp_cycles = 1 + 7
-            rowsum_cycles = 7
+            exp_cycles = 1 + 20
             xcel_pipeline_depth = sum(
                 [
                     rowmax_cycles,
                     exp_cycles,
-                    rowsum_cycles,
                     2,  # +2 for exp_mi and exp_mij following up after sij
                 ]
             )
 
             self.xcel_cycles = (
-                self.bs * self.h * Tc * Tr * (Br)
+                self.bs * self.h * Tc * Tr * (Br + xcel_pipeline_depth)
             )
 
             self.vec_count = (
@@ -174,8 +170,9 @@ class FlashAttention(Operator):
                 * Tr
                 * sum(
                     [
-                        3 * Br,
-                        4 * Br * self.d_h,
+                        Br, # exp_mi_li
+                        Br * Bc, # lij
+                        4 * Br * self.d_h, # temp
                     ]
                 )
             )
