@@ -15,7 +15,7 @@ class FlashAttention(Operator):
         self.input3_shape = None
         self.output_shape = None
         self.use_xcel = use_xcel
-        self.xcel_freq = 1e9
+        self.xcel_freq = 1.8e9
         if use_xcel:
             self.br = 128
             self.bc = 128
