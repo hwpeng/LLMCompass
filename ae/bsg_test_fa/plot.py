@@ -62,7 +62,7 @@ def plot(dfs, filename):
         for i, (category, value) in enumerate(zip(categories[3:], values[3:])):
             if category not in plot_categories:
                 continue
-            if row_index == "STD":
+            if row_index == df_labels[0]:
                 plt.bar(
                     x, value, bottom=bottom, color=colors[i], label=category, width=0.5
                 )
@@ -87,5 +87,5 @@ def plot(dfs, filename):
     plt.show()
 
 
-plot([h100_prefill_std_attn, h100_prefill_std_attn, our_prefill_std_attn, our_prefill_flash_attn, our_prefill_xcel_attn], "figure_prefill.pdf")
-plot([h100_decode_std_attn, h100_decode_std_attn, our_decode_std_attn, our_decode_flash_attn, our_decode_xcel_attn], "figure_decode.pdf")
+plot([h100_prefill_std_attn, h100_prefill_flash_attn, our_prefill_std_attn, our_prefill_flash_attn, our_prefill_xcel_attn], "figure_prefill.pdf")
+plot([h100_decode_std_attn, h100_decode_flash_attn, our_decode_std_attn, our_decode_flash_attn, our_decode_xcel_attn], "figure_decode.pdf")
