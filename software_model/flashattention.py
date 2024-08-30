@@ -143,9 +143,9 @@ class FlashAttention(Operator):
                         ]
                     )
                 )
-                print("FLASHATTENTION")
-                print(f"{self.vec_count=}")
-                print(f"{self.vec_count / pcb_module.compute_module.total_vector_flops=}")
+                # print("FLASHATTENTION")
+                # print(f"{self.vec_count=}")
+                # print(f"{self.vec_count / pcb_module.compute_module.total_vector_flops=}")
 
         # use the xcel
         else:
@@ -176,11 +176,11 @@ class FlashAttention(Operator):
                     ]
                 )
             )
-            print("XCEL FLASHATTN")
-            print(f"{self.vec_count=}")
-            print(f"{self.xcel_cycles=}")
-            print(f"{self.vec_count / pcb_module.compute_module.total_vector_flops=}")
-            print(f"{self.xcel_cycles / (self.xcel_freq * pcb_module.compute_module.core_count)=}")
+            # print("XCEL FLASHATTN")
+            # print(f"{self.vec_count=}")
+            # print(f"{self.xcel_cycles=}")
+            # print(f"{self.vec_count / pcb_module.compute_module.total_vector_flops=}")
+            # print(f"{self.xcel_cycles / (self.xcel_freq * pcb_module.compute_module.core_count)=}")
 
         comp_bound_latency = (
             self.flop_count / pcb_module.compute_module.total_systolic_array_flops
@@ -189,13 +189,13 @@ class FlashAttention(Operator):
         )
 
         if io_bound_latency > comp_bound_latency:
-            print("IO BOUND")
+            # print("IO BOUND")
             self.roofline_latency = io_bound_latency
             self.q_mul_k_lat = q_mul_k_io_count / io_bw
             self.a_mul_v_lat = p_mul_v_io_count / io_bw
             self.softmax_lat = softmax_io_count / io_bw
         else:
-            print("COMP BOUND")
+            # print("COMP BOUND")
             self.roofline_latency = comp_bound_latency
             self.q_mul_k_lat = (
                 q_mul_k_flops / pcb_module.compute_module.total_systolic_array_flops

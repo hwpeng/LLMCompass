@@ -307,6 +307,42 @@ class Matmul(Operator):
         M = self.computational_graph.M
         N = self.computational_graph.N
         K = self.computational_graph.K
+
+        sa_h = pcb_module.compute_module.core.systolic_array.array_height
+        sa_w = pcb_module.compute_module.core.systolic_array.array_width
+        sa_bw = pcb_module.compute_module.l2_bandwidth_per_cycle
+        file_name = f'./LC_matmul_count/{sa_h}_{sa_w}_{int(sa_bw)}.csv'
+        if not os.path.exists(file_name):
+            os.makedirs(os.path.dirname(file_name), exist_ok=True)
+            with open(file_name, 'w') as f:
+                f.write('')
+            #     f.write('M,N,K,l2_tile_M,l2_tile_N,l2_tile_K,is_l2_double_buffering,')
+            #     f.write('l1_tile_M,l1_tile_N,l1_tile_K,l2_loop_order,l1_loop_order,')
+            #     f.write('l0_M_tiling_factor,l0_N_tiling_factor,l0_K_tiling_factor,dataflow,cycle_count\n')
+        self.mapping_table = pd.read_csv(file_name,
+                                         header=None,
+                                         names=[
+                                             'M', 'N', 'K', 'l2_tile_M', 'l2_tile_N', 'l2_tile_K', 'is_l2_double_buffering',
+                                             'l1_tile_M', 'l1_tile_N', 'l1_tile_K', 'l2_loop_order', 'l1_loop_order',
+                                             'l0_M_tiling_factor', 'l0_N_tiling_factor', 'l0_K_tiling_factor', 'dataflow', 'cycle_count'
+                                         ],
+                                         dtype={'M': int, 'N': int, 'K': int, 'l2_tile_M': int, 'l2_tile_N': int, 'l2_tile_K': int, 'is_l2_double_buffering': bool,
+                                                'l1_tile_M': int, 'l1_tile_N': int, 'l1_tile_K': int, 'l2_loop_order': str, 'l1_loop_order': str,
+                                                'l0_M_tiling_factor': int, 'l0_N_tiling_factor': int, 'l0_K_tiling_factor': int, 'dataflow': str, 'cycle_count': int}
+                                         )
+        self.mapping_table.drop_duplicates(
+            inplace=True,
+            subset=['M', 'N', 'K', 'l2_tile_M', 'l2_tile_N', 'l2_tile_K', 'is_l2_double_buffering',
+                    'l1_tile_M', 'l1_tile_N', 'l1_tile_K', 'l2_loop_order', 'l1_loop_order',
+                    'l0_M_tiling_factor', 'l0_N_tiling_factor', 'l0_K_tiling_factor', 'dataflow']
+        )
+        self.mapping_table.set_index(
+            ['M', 'N', 'K', 'l2_tile_M', 'l2_tile_N', 'l2_tile_K', 'is_l2_double_buffering',
+             'l1_tile_M', 'l1_tile_N', 'l1_tile_K', 'l2_loop_order', 'l1_loop_order',
+             'l0_M_tiling_factor', 'l0_N_tiling_factor', 'l0_K_tiling_factor', 'dataflow'],
+            inplace=True
+        ) 
+
         if (M == 1 or N == 1) and (
             compile_mode == "heuristic-GPU"
             or compile_mode == "heuristic-our-throughput"
@@ -874,6 +910,30 @@ class Matmul(Operator):
         mapping: Mapping,
         pcb_module: Device,
     ) -> int:
+        key = (
+            int(computational_graph.M),
+            int(computational_graph.N),
+            int(computational_graph.K),
+            int(mapping.l2_tile_M),
+            int(mapping.l2_tile_N),
+            int(mapping.l2_tile_K),
+            mapping.is_l2_double_buffering,
+            int(mapping.l1_tile_M),
+            int(mapping.l1_tile_N),
+            int(mapping.l1_tile_K),
+            str(mapping.l2_loop_order),
+            str(mapping.l1_loop_order),
+            int(mapping.l0_M_tiling_factor),
+            int(mapping.l0_N_tiling_factor),
+            int(mapping.l0_K_tiling_factor),
+            str(mapping.dataflow),
+        )
+        if key in self.mapping_table.index:
+            cycle_count = self.mapping_table.loc[key, "cycle_count"]
+            return int(cycle_count)
+        # else:
+            # print(f"Mapping not found: {key}")
+
         if self.look_up_table is None:
             self.look_up_table = pd.read_csv(
                 f"./systolic_array_model/look_up_table_{pcb_module.compute_module.core.systolic_array.array_height}_{pcb_module.compute_module.core.systolic_array.array_width}.csv",
@@ -1093,6 +1153,15 @@ class Matmul(Operator):
 
         if previous_k > 0:
             total_cycle_count += ceil(l2_tiles[-1, -1, -1].K_reduction_cycle_count)
+        
+        sa_h = pcb_module.compute_module.core.systolic_array.array_height
+        sa_w = pcb_module.compute_module.core.systolic_array.array_width
+        sa_bw = pcb_module.compute_module.l2_bandwidth_per_cycle
+        file_name = f'./LC_matmul_count/{sa_h}_{sa_w}_{int(sa_bw)}.csv'
+        with open(file_name, 'a') as f:
+            for k in key:
+                f.write(f'{k},')
+            f.write(f'{total_cycle_count}\n')
 
         return total_cycle_count #+ ceil(
         # pcb_module.io_module.latency * 2 * pcb_module.compute_module.clock_freq
