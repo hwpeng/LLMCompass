@@ -150,8 +150,8 @@ class Matmul(Operator):
 
     def __call__(self, input1: Tensor, input2: Tensor) -> Tensor:
         # [bs, M, K] * [K, N] = [bs, M, N]
-        assert self.data_type == input1.data_type
-        assert self.data_type == input2.data_type
+        # assert self.data_type == input1.data_type
+        # assert self.data_type == input2.data_type
         self.input1_shape = input1.shape
         self.input2_shape = input2.shape
         self.M = size(self.input1_shape[:-1])
@@ -564,6 +564,7 @@ class Matmul(Operator):
                                 best_mapping = mapping
         elif compile_mode == "heuristic-GPU":
             i = 0
+            all_mappings = []
             for l2_tile_M in [64, 128, 256, 512, 1024, 2048]:
                 for l2_tile_N in [l2_tile_M // 2, l2_tile_M, l2_tile_M * 2]:
                     if K <= 12288:
@@ -641,6 +642,7 @@ class Matmul(Operator):
                                         l0_N_tiling_factor,
                                         l0_K_tiling_factor,
                                     )
+                                    # all_mappings.append(mapping)
                                     cycle_count = self.simulate(
                                         self.computational_graph,
                                         mapping,
@@ -652,6 +654,17 @@ class Matmul(Operator):
                                     if cycle_count < min_cycle_count:
                                         min_cycle_count = cycle_count
                                         best_mapping = mapping
+            # num_cores = multiprocessing.cpu_count()
+            # num_cores = 64
+            # with multiprocessing.Pool(num_cores) as pool:
+            #     cycle_counts = pool.starmap(
+            #         self.simulate,
+            #         [(self.computational_graph, mapping, pcb_module) for mapping in all_mappings],
+            #     )
+            #     for i, cycle_count in enumerate(cycle_counts):
+            #         if cycle_count < min_cycle_count:
+            #             min_cycle_count = cycle_count
+            #             best_mapping = all_mappings[i]
             # print("total dse times:", i)
         elif compile_mode == "heuristic-TPU":
             l2_tile_M = self.computational_graph.M
@@ -883,16 +896,16 @@ class Matmul(Operator):
                                     #     best_mapping = mapping
             # simulate all mappings using multiprocessing
             # print(f"Total mappings: {len(all_mappings)}")
-            num_cores = multiprocessing.cpu_count()
-            with multiprocessing.Pool(num_cores) as pool:
-                cycle_counts = pool.starmap(
-                    self.simulate,
-                    [(self.computational_graph, mapping, pcb_module) for mapping in all_mappings],
-                )
-                for i, cycle_count in enumerate(cycle_counts):
-                    if cycle_count < min_cycle_count:
-                        min_cycle_count = cycle_count
-                        best_mapping = all_mappings[i]
+            # num_cores = multiprocessing.cpu_count()
+            # with multiprocessing.Pool(num_cores) as pool:
+            #     cycle_counts = pool.starmap(
+            #         self.simulate,
+            #         [(self.computational_graph, mapping, pcb_module) for mapping in all_mappings],
+            #     )
+            #     for i, cycle_count in enumerate(cycle_counts):
+            #         if cycle_count < min_cycle_count:
+            #             min_cycle_count = cycle_count
+            #             best_mapping = all_mappings[i]
         else:
             raise ValueError(f"compile_mode {compile_mode} not supported")
         self.best_mapping = best_mapping
@@ -935,8 +948,10 @@ class Matmul(Operator):
             # print(f"Mapping not found: {key}")
 
         if self.look_up_table is None:
+            _this_dir = os.path.dirname(os.path.abspath(__file__))
+            systolic_array_look_up_table_path = f"{_this_dir}/../systolic_array_model/look_up_table_{pcb_module.compute_module.core.systolic_array.array_height}_{pcb_module.compute_module.core.systolic_array.array_width}.csv"
             self.look_up_table = pd.read_csv(
-                f"./systolic_array_model/look_up_table_{pcb_module.compute_module.core.systolic_array.array_height}_{pcb_module.compute_module.core.systolic_array.array_width}.csv",
+                systolic_array_look_up_table_path,
                 header=None,
                 names=[
                     "M",
